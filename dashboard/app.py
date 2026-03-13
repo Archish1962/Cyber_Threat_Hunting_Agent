@@ -186,6 +186,10 @@ html, body, [class*="css"] {
 /* ── Misc ── */
 .empty-state { text-align:center; color:#3d444d; font-size:0.8rem; padding:2rem; letter-spacing:2px; }
 .db-warning  { background:rgba(248,81,73,0.1); border:1px solid rgba(248,81,73,0.3); border-radius:6px; padding:1.2rem; color:#f85149; font-family:'Share Tech Mono',monospace; font-size:0.8rem; text-align:center; }
+
+/* ── Blocked IPs tab ── */
+.blocked-header { font-size:0.65rem; letter-spacing:2px; color:#f85149; text-transform:uppercase; margin-bottom:0.5rem; }
+.sidebar-summary-box { background:#0d1117; border:1px solid #21262d; border-radius:4px; padding:0.6rem 0.8rem; margin-bottom:0.5rem; font-size:0.72rem; color:#8b949e; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -193,27 +197,96 @@ html, body, [class*="css"] {
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
+# Session state for the two-step delete confirmation (persists across rerenders)
+if "confirm_delete_logs" not in st.session_state:
+    st.session_state.confirm_delete_logs = False
+
 with st.sidebar:
     st.markdown("### ⚙ DASHBOARD CONTROLS")
     st.markdown("---")
-    if st.button(
-        "🗑 Reset Demo Data",
-        type="secondary",
-        width="stretch",
-        help="Wipes all events and threats from the DB. Use between judge demo runs.",
-    ):
-        if os.path.exists(DB_PATH):
-            try:
-                conn = sqlite3.connect(DB_PATH)
-                conn.execute("DELETE FROM logs")
-                conn.execute("DELETE FROM alerts")
-                conn.commit()
-                conn.close()
-                st.success("✓ Database cleared. Fresh demo ready.")
-            except Exception as e:
-                st.error(f"Reset failed: {e}")
+
+    # ── Delete Raw Logs (Fix 1) ────────────────────────────────────────────
+    # Step 1: show the button. Step 2: show summary + confirm / cancel.
+    # Only raw event logs are deleted — alerts are the audit trail and are
+    # always preserved so the SOC supervisor never loses incident history.
+    if not st.session_state.confirm_delete_logs:
+        if st.button(
+            "🗑 Delete Raw Logs",
+            type="secondary",
+            use_container_width=True,
+            help="Shows a per-type count before deleting. Alerts are always preserved.",
+        ):
+            st.session_state.confirm_delete_logs = True
+            st.rerun()
+    else:
+        st.markdown("**⚠ Confirm Deletion**")
+        if not os.path.exists(DB_PATH):
+            st.warning("DB not found.")
+            st.session_state.confirm_delete_logs = False
         else:
-            st.warning("DB file not found.")
+            try:
+                _sc = sqlite3.connect(DB_PATH)
+                _summary = pd.read_sql_query(
+                    "SELECT event_type, COUNT(*) AS cnt FROM logs "
+                    "GROUP BY event_type ORDER BY cnt DESC",
+                    _sc,
+                )
+                _total_logs = int(
+                    pd.read_sql_query("SELECT COUNT(*) AS n FROM logs", _sc).iloc[0][
+                        "n"
+                    ]
+                )
+                _oldest = (
+                    pd.read_sql_query("SELECT MIN(timestamp) AS t FROM logs", _sc).iloc[
+                        0
+                    ]["t"]
+                    or "—"
+                )
+                _newest = (
+                    pd.read_sql_query("SELECT MAX(timestamp) AS t FROM logs", _sc).iloc[
+                        0
+                    ]["t"]
+                    or "—"
+                )
+                _alert_count = int(
+                    pd.read_sql_query("SELECT COUNT(*) AS n FROM alerts", _sc).iloc[0][
+                        "n"
+                    ]
+                )
+                _sc.close()
+
+                st.warning(f"**{_total_logs}** log entries will be deleted:")
+                for _, _row in _summary.iterrows():
+                    st.caption(f"• {_row['event_type']}: {int(_row['cnt'])}")
+                st.caption(f"📅 Oldest : {str(_oldest)[:19]}")
+                st.caption(f"📅 Newest : {str(_newest)[:19]}")
+                st.success(f"✓ {_alert_count} alert(s) will be **preserved**.")
+
+                _c1, _c2 = st.columns(2)
+                with _c1:
+                    if st.button(
+                        "✓ Delete",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        try:
+                            _dc = sqlite3.connect(DB_PATH)
+                            _dc.execute("DELETE FROM logs")
+                            _dc.commit()
+                            _dc.close()
+                            st.session_state.confirm_delete_logs = False
+                            st.success("✓ Logs cleared.")
+                        except Exception as _de:
+                            st.error(f"Delete failed: {_de}")
+                with _c2:
+                    if st.button("✗ Cancel", use_container_width=True):
+                        st.session_state.confirm_delete_logs = False
+                        st.rerun()
+
+            except Exception as _e:
+                st.error(f"Could not load summary: {_e}")
+                st.session_state.confirm_delete_logs = False
+
     st.markdown("---")
     st.caption(f"DB path:\n`{DB_PATH}`")
     st.caption("Dashboard auto-refreshes every **3 seconds** via `@st.fragment`.")
@@ -264,6 +337,24 @@ def get_top_ips() -> pd.DataFrame:
             ORDER  BY "Total Events" DESC
             LIMIT  10
             """,
+            conn,
+        )
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_blocked_ips() -> pd.DataFrame:
+    """
+    Return all rows from blocked_ips ordered by most recently blocked first.
+    Returns an empty DataFrame if the table doesn't exist yet (agent hasn't
+    run its first cycle) — dashboard degrades gracefully.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        df = pd.read_sql_query(
+            "SELECT * FROM blocked_ips ORDER BY blocked_at DESC",
             conn,
         )
         conn.close()
@@ -406,7 +497,6 @@ _AXIS_KWARGS: dict[str, Any] = dict(
 # ── Fragment: entire live dashboard re-renders every 3 s ──────────────────────
 @st.fragment(run_every=3)
 def live_dashboard():
-
     # ── Live clock ────────────────────────────────────────────────────────────
     now_str = datetime.now(IST).strftime("%Y-%m-%d  %H:%M:%S IST")
     st.markdown(
@@ -657,11 +747,12 @@ def live_dashboard():
 
     # ── Bottom analytics tabs (replaces 3-column row to avoid page over-scroll) ─
     st.markdown("---")
-    tab1, tab2, tab3 = st.tabs(
+    tab1, tab2, tab3, tab4 = st.tabs(
         [
             "◈  EVENTS TIMELINE",
             "◈  ATTACK TYPES",
             "◈  TOP ATTACKING IPs",
+            "◈  BLOCKED IPs",
         ]
     )
 
@@ -753,6 +844,91 @@ def live_dashboard():
                     ),
                 },
             )
+
+    # ── Tab 4: Blocked IPs ────────────────────────────────────────────────────
+    with tab4:
+        blocked_df = get_blocked_ips()
+        if blocked_df.empty:
+            st.markdown(
+                '<div class="empty-state">NO BLOCKED IPs — AGENT HAS NOT BLOCKED ANY IPs YET</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            n_blocked = (
+                int((blocked_df["status"] == "blocked").sum())
+                if "status" in blocked_df.columns
+                else 0
+            )
+            n_unblocked = (
+                int((blocked_df["status"] == "unblocked").sum())
+                if "status" in blocked_df.columns
+                else 0
+            )
+            st.markdown(
+                f'<div class="blocked-header">'
+                f"⛔ {n_blocked} ACTIVE BLOCK(S) &nbsp;·&nbsp; ✓ {n_unblocked} CLEARED"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            for _, brow in blocked_df.iterrows():
+                b_ip = safe_html(brow.get("ip", "?"))
+                b_reason = safe_html(brow.get("reason", "—"))
+                b_risk = safe_html(str(brow.get("risk_level", "—")).upper())
+                b_time = fmt_time(str(brow.get("blocked_at") or ""))
+                b_status = str(brow.get("status", "blocked")).lower()
+                b_row_id = int(brow.get("id") or 0)
+                b_cleared = brow.get("unblocked_at")
+
+                risk_col = "#f85149" if b_risk == "CRITICAL" else "#d29922"
+                stat_col = "#f85149" if b_status == "blocked" else "#3fb950"
+                stat_label = "⛔ BLOCKED" if b_status == "blocked" else "✓ UNBLOCKED"
+                cleared_str = (
+                    f" &nbsp;|&nbsp; ✓ Cleared: {fmt_time(str(b_cleared))}"
+                    if b_cleared
+                    else ""
+                )
+
+                col_info, col_btn = st.columns([4, 1])
+                with col_info:
+                    st.markdown(
+                        f'<div style="background:#0d1117;border:1px solid #21262d;'
+                        f"border-left:3px solid {risk_col};border-radius:4px;"
+                        f'padding:0.55rem 0.8rem;margin-bottom:4px;">'
+                        f"<span style=\"font-family:'Share Tech Mono',monospace;"
+                        f"font-size:0.85rem;font-weight:700;color:{risk_col};"
+                        f'">{b_ip}</span>'
+                        f'&nbsp;&nbsp;<span style="font-size:0.6rem;font-weight:700;'
+                        f"color:{stat_col};background:rgba(0,0,0,0.3);"
+                        f'padding:1px 7px;border-radius:10px;">{stat_label}</span>'
+                        f'<div style="font-size:0.67rem;color:#8b949e;margin-top:3px;'
+                        f"font-family:'Share Tech Mono',monospace;\">"
+                        f"⚡ {b_reason} &nbsp;|&nbsp; ⏱ {b_time}{cleared_str}"
+                        f"</div></div>",
+                        unsafe_allow_html=True,
+                    )
+                with col_btn:
+                    if b_status == "blocked":
+                        if st.button(
+                            "Unblock",
+                            key=f"unblock_{b_row_id}",
+                            type="secondary",
+                            use_container_width=True,
+                        ):
+                            try:
+                                _uc = sqlite3.connect(DB_PATH)
+                                _uc.execute(
+                                    "UPDATE blocked_ips "
+                                    "SET status = 'unblocked', "
+                                    "    unblocked_at = datetime('now') "
+                                    "WHERE id = ?",
+                                    (b_row_id,),
+                                )
+                                _uc.commit()
+                                _uc.close()
+                            except Exception as _ue:
+                                st.error(f"Unblock failed: {_ue}")
+                    else:
+                        st.caption("Cleared")
 
     # ── Footer ────────────────────────────────────────────────────────────────
     st.markdown("---")

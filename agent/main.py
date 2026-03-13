@@ -118,6 +118,39 @@ def _ensure_alerts_table(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _ensure_blocked_ips_table(conn: sqlite3.Connection) -> None:
+    """
+    Create the blocked_ips table if it doesn't already exist.
+
+    This table is the shared contract for active IP blocking:
+      - Agent WRITES a new row whenever a HIGH/CRITICAL threat is confirmed.
+      - Backend middleware READS it on every request to decide whether to 403.
+      - Dashboard READS and WRITES it (unblock button sets status='unblocked').
+
+    status values:
+      'blocked'   → backend middleware will reject requests from this IP.
+      'unblocked' → analyst cleared the block; row kept for audit history.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS blocked_ips (
+            id            INTEGER  PRIMARY KEY AUTOINCREMENT,
+            ip            TEXT     NOT NULL,
+            reason        TEXT,               -- e.g. "Brute Force Attack (confidence: 91%)"
+            risk_level    TEXT,               -- 'HIGH' or 'CRITICAL'
+            blocked_at    TEXT     NOT NULL,  -- UTC ISO datetime
+            status        TEXT     NOT NULL DEFAULT 'blocked',
+            unblocked_at  TEXT                -- NULL while active; set when analyst unblocks
+        );
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_blocked_ips_ip_status "
+        "ON blocked_ips (ip, status);"
+    )
+    conn.commit()
+
+
 def _save_alert_initial(conn: sqlite3.Connection, alert: ThreatAlert) -> int:  # noqa: E501
     """
     Phase 1 — Insert the detection result immediately with empty LLM fields.
@@ -172,6 +205,54 @@ def _update_alert_llm(
         (alert.llm_hypothesis, alert.llm_report, row_id),
     )
     conn.commit()
+
+
+def _block_ip(conn: sqlite3.Connection, alert: ThreatAlert) -> None:
+    """
+    Write the attacker's IP to the blocked_ips table when the confirmed
+    threat is HIGH or CRITICAL risk.
+
+    The backend middleware reads this table on every incoming request and
+    returns HTTP 403 immediately if the IP has an active 'blocked' entry.
+
+    Guards:
+      - Only acts on HIGH / CRITICAL alerts (MEDIUM and LOW are not blocked
+        automatically — they need human review first).
+      - Skips if the IP already has an active 'blocked' row so a single
+        attack that fires multiple rules doesn't create duplicate entries.
+    """
+    if alert.risk_level not in ("HIGH", "CRITICAL"):
+        return
+
+    # Check for an existing active block to avoid duplicate rows
+    cur = conn.execute(
+        "SELECT 1 FROM blocked_ips WHERE ip = ? AND status = 'blocked' LIMIT 1",
+        (alert.source_ip,),
+    )
+    if cur.fetchone() is not None:
+        _log(
+            "info",
+            f"  ↳ IP {alert.source_ip} already blocked — skipping duplicate entry.",
+        )
+        return
+
+    conn.execute(
+        """
+        INSERT INTO blocked_ips (ip, reason, risk_level, blocked_at, status)
+        VALUES (?, ?, ?, ?, 'blocked')
+        """,
+        (
+            alert.source_ip,
+            f"{alert.threat_type} (confidence: {alert.confidence}%)",
+            alert.risk_level,
+            alert.timestamp,
+        ),
+    )
+    conn.commit()
+    _log(
+        "alert",
+        f"  ↳ IP {alert.source_ip} BLOCKED → {alert.risk_level} | {alert.threat_type}",
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -262,7 +343,11 @@ def _enrich_with_llm(alert: ThreatAlert) -> ThreatAlert:
         "info",
         f"  ↳ Hypothesizing via LLM for {alert.threat_type} from {alert.source_ip}...",
     )
-    alert.llm_hypothesis = generate_hypothesis(observation)
+    alert.llm_hypothesis = generate_hypothesis(
+        observation,
+        threat_type=alert.threat_type,
+        source_ip=alert.source_ip,
+    )
 
     # ── Step: Explain ────────────────────────────────────────────────────────
     _log("info", "  ↳ Generating incident report...")
@@ -418,8 +503,9 @@ def _run_agent_cycle() -> list:
     """
     conn = _get_connection()
     try:
-        # Ensure the alerts table exists (idempotent)
+        # Ensure all agent-owned tables exist (both calls are idempotent)
         _ensure_alerts_table(conn)
+        _ensure_blocked_ips_table(conn)
 
         # ── Step 1: Observe + Investigate ───────────────────────────────────
         # run_all_rules queries the logs table and applies every rule.
@@ -447,6 +533,11 @@ def _run_agent_cycle() -> list:
                 f"Detection saved → {alert.risk_level} | {alert.threat_type} | "
                 f"IP: {alert.source_ip} | Confidence: {alert.confidence}%",
             )
+
+            # ── Step 3b: Block IP immediately for HIGH / CRITICAL threats ────
+            # Writes to blocked_ips table. Backend middleware reads it and
+            # returns 403 to the attacker on all subsequent requests.
+            _block_ip(conn, alert)
 
             # ── Step 4: Hypothesize + Explain (LLM) ─────────────────────────
             # Runs AFTER the DB write so the dashboard is never blocked.

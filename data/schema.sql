@@ -2,17 +2,22 @@
 -- Cyber Threat Hunting Agent - Shared Database Schema
 -- =============================================================================
 -- OWNERSHIP RULES:
---   logs    table  --> Written by: backend/api.py | Read by: agent, dashboard
---   alerts  table  --> Written by: agent/main.py  | Read by: dashboard
+--   logs        table --> Written by: backend/api.py  | Read by: agent, dashboard
+--   alerts      table --> Written by: agent/main.py   | Read by: dashboard
+--   blocked_ips table --> Written by: agent/main.py   | Read+Written by: dashboard
+--                         Read by: backend middleware
 -- =============================================================================
 
--- Drop tables if they exist (for clean re-initialization)
-DROP TABLE IF EXISTS alerts;
-DROP TABLE IF EXISTS logs;
+-- NOTE: NO DROP TABLE statements here.
+-- init_db() is called on every backend startup. DROP TABLE would wipe all
+-- runtime data (alerts, blocked IPs, live logs) every time the server restarts
+-- or uvicorn hot-reloads. CREATE TABLE IF NOT EXISTS is fully idempotent and
+-- safe to call on every startup.
 
 -- -----------------------------------------------------------------------------
 -- LOGS TABLE
 -- Every incoming request to the Victim App is written here by the backend.
+-- The agent reads this table every 5 seconds to run its 8 detection rules.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS logs (
     id           INTEGER  PRIMARY KEY AUTOINCREMENT,
@@ -26,7 +31,7 @@ CREATE TABLE IF NOT EXISTS logs (
     status       TEXT                 -- 'success', 'fail', 'blocked'
 );
 
--- Index on ip + timestamp for fast agent rule queries
+-- Indices for fast agent rule queries (ip+time is the most common filter)
 CREATE INDEX IF NOT EXISTS idx_logs_ip_time     ON logs (ip, timestamp);
 CREATE INDEX IF NOT EXISTS idx_logs_event_time  ON logs (event_type, timestamp);
 CREATE INDEX IF NOT EXISTS idx_logs_endpoint    ON logs (endpoint, timestamp);
@@ -34,6 +39,9 @@ CREATE INDEX IF NOT EXISTS idx_logs_endpoint    ON logs (endpoint, timestamp);
 -- -----------------------------------------------------------------------------
 -- ALERTS TABLE
 -- Every confirmed threat detected by the agent is written here.
+-- The dashboard polls this table to display threat cards and SOC reports.
+-- LLM fields (llm_hypothesis, llm_report) are briefly empty strings right
+-- after the Phase 1 save — the dashboard must handle empty strings gracefully.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS alerts (
     id              INTEGER  PRIMARY KEY AUTOINCREMENT,
@@ -48,6 +56,36 @@ CREATE TABLE IF NOT EXISTS alerts (
     llm_report      TEXT                -- Human-readable incident report from Ollama
 );
 
--- Index for dashboard to quickly fetch recent/unread alerts
+-- Indices for dashboard to quickly fetch recent alerts and group by IP/type
 CREATE INDEX IF NOT EXISTS idx_alerts_time      ON alerts (timestamp);
 CREATE INDEX IF NOT EXISTS idx_alerts_ip_type   ON alerts (source_ip, threat_type, timestamp);
+
+-- -----------------------------------------------------------------------------
+-- BLOCKED IPs TABLE
+-- Written by the agent when it detects a HIGH or CRITICAL threat.
+-- The backend middleware checks this table on every incoming request and
+-- returns HTTP 403 immediately if the source IP has status = 'blocked'.
+-- The dashboard reads this table to display the blocked IPs panel and
+-- writes back to it when a SOC analyst clicks the Unblock button.
+--
+-- status values:
+--   'blocked'   → backend will reject all requests from this IP
+--   'unblocked' → analyst manually cleared the block; record kept for audit
+--
+-- A new row is inserted each time the agent blocks an IP (even if it was
+-- previously unblocked), so repeat-offenders are clearly visible in history.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS blocked_ips (
+    id            INTEGER  PRIMARY KEY AUTOINCREMENT,
+    ip            TEXT     NOT NULL,
+    reason        TEXT,               -- e.g. "Brute Force Attack (confidence: 91%)"
+    risk_level    TEXT,               -- 'HIGH' or 'CRITICAL'
+    blocked_at    TEXT     NOT NULL,  -- UTC ISO datetime written by the agent
+    status        TEXT     NOT NULL DEFAULT 'blocked',  -- 'blocked' | 'unblocked'
+    unblocked_at  TEXT                -- NULL while still blocked; set when analyst unblocks
+);
+
+-- Fast lookup used by the backend middleware on every request
+CREATE INDEX IF NOT EXISTS idx_blocked_ips_ip_status ON blocked_ips (ip, status);
+-- For dashboard history view ordered by time
+CREATE INDEX IF NOT EXISTS idx_blocked_ips_time      ON blocked_ips (blocked_at);
