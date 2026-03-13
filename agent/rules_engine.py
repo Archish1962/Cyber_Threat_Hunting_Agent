@@ -154,6 +154,7 @@ class ThreatAlert:
     )
     llm_hypothesis: str = ""  # filled in by llm_client after detection
     llm_report: str = ""  # filled in by llm_client after detection
+    llm_cache_used: bool = False  # True if LLM response(s) came from in-memory cache
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -166,6 +167,7 @@ class ThreatAlert:
             "details": self.details,
             "llm_hypothesis": self.llm_hypothesis,
             "llm_report": self.llm_report,
+            "llm_cache_used": self.llm_cache_used,
         }
 
 

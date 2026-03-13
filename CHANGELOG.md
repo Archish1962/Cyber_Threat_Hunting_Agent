@@ -388,3 +388,116 @@ A 1,985-line, 68,700-character technical reference document covering the entire 
 | 11. Full Walk-Through | Minute-by-minute, function-by-function trace of one complete Brute Force attack from attacker request through detection, both LLM calls, two-phase DB save, and final dashboard display — including exact SQL results, exact HTTP request/response bodies, and console output |
 | 12. Error Handling | Every failure mode documented: Ollama offline, database missing, database locked, LLM timeout, unexpected cycle exception, Python version too old — with exact error message text and what the agent does in each case |
 | 13. Integration With Teammates | Exact column names and value formats Teammate 1 must write to the logs table, two critical rules (log successes, do not URL-decode paths), recommended Streamlit query snippet for Teammate 3 with IST conversion and JSON parsing, three-process architecture diagram |
+
+---
+
+---
+
+## [Session 9] — Integration Audit + Judge Feedback Fixes
+
+**Trigger:** Full integrated codebase reviewed for the first time with all three teammates' components present (`backend/`, `agent/`, `dashboard/`). Two pre-existing architectural discrepancies were identified and fixed. Three improvements based on post-demo judge feedback were then designed and implemented.
+
+---
+
+### Discrepancy Fixes (found during cross-reference against `AGENT_DOCUMENTATION.md`)
+
+#### Fixed — `data/schema.sql` — Critical: DROP TABLE wiped data on every startup
+
+**What was wrong:** The schema file opened with `DROP TABLE IF EXISTS alerts` and `DROP TABLE IF EXISTS logs`. The backend calls `init_db()` on every startup via the FastAPI `lifespan` hook, which executes the full schema. With `reload=True` in uvicorn, every saved file during development triggered a hot-reload, which triggered `init_db()`, which dropped all tables — silently wiping every alert and log in the database.
+
+**Fix:** Removed both `DROP TABLE IF EXISTS` lines entirely. `CREATE TABLE IF NOT EXISTS` is fully idempotent and was already present — no other change was needed. The schema is now safe to execute on every startup.
+
+**Files changed:** `data/schema.sql`
+
+---
+
+#### Fixed — `backend/db.py` — Moderate: No WAL mode or busy-timeout on backend connections
+
+**What was wrong:** `get_connection()` returned a bare `sqlite3.connect(DB_PATH)` with no timeout and no WAL mode. The `AGENT_DOCUMENTATION.md` explicitly specifies WAL mode is required for safe concurrent reads. The agent's own `_get_connection()` already used WAL mode and a 5-second timeout; the backend did not — creating a mismatch that could cause `OperationalError: database is locked` when both processes wrote simultaneously during a demo.
+
+**Fix:** Added `timeout=5` and `PRAGMA journal_mode=WAL` to `backend/db.py`'s `get_connection()`, matching the agent's approach.
+
+**Files changed:** `backend/db.py`
+
+---
+
+### Fix 1 — User-Controlled Log Deletion (judge feedback: "logs spamming / cloud storage")
+
+**Design decision:** The original plan was automatic hourly log rotation (DELETE WHERE timestamp < now - 1 hour). This was rejected because the supervisor (SOC analyst on the dashboard) might not have seen the logs yet. Auto-deletion without consent defeats the human-in-the-loop philosophy.
+
+**What was implemented:** The existing sidebar "Reset Demo Data" button (which silently deleted both `logs` AND `alerts` with no confirmation) was replaced with a **two-step confirmation flow**:
+
+- Step 1: A "Delete Raw Logs" button appears in the sidebar
+- Step 2: Clicking it shows a pre-deletion summary: row counts per `event_type`, oldest entry timestamp, newest entry timestamp, and a confirmation that alerts are preserved
+- The SOC analyst reads the summary and either confirms or cancels
+- **Only `logs` is deleted.** The `alerts` table is never touched — it is the permanent incident audit trail
+
+**Why this matters for the demo:** Directly answers the judge concern about storage while showing the system respects human oversight. The "X alerts preserved" message demonstrates that detection history is always retained even when raw event data is cleaned up.
+
+**Files changed:** `dashboard/app.py`
+
+| What changed | Detail |
+|---|---|
+| Removed | Old one-click "Reset Demo Data" button (deleted both tables silently) |
+| Added | `st.session_state.confirm_delete_logs` — tracks two-step confirmation state |
+| Added | Pre-deletion summary: per-`event_type` counts, oldest/newest timestamps, alert preservation notice |
+| Added | Confirm / Cancel buttons with correct DB operations |
+
+---
+
+### Fix 2 — Active IP Blocking (judge feedback: "doesn't block DDoS like Cloudflare")
+
+**Design:** When the agent detects a HIGH or CRITICAL threat, it immediately writes the attacker's IP to a new `blocked_ips` table. The backend reads this table on every incoming request and returns HTTP 403 before the route handler executes. The dashboard shows all blocked IPs in a new tab and lets the SOC analyst unblock individual IPs. Records are never deleted — unblocking sets `status='unblocked'` and records `unblocked_at`, preserving the full audit trail.
+
+**New table — `blocked_ips`:**
+
+| Column | Type | Purpose |
+|---|---|---|
+| `id` | INTEGER PK | Row identity |
+| `ip` | TEXT | Attacker IP address |
+| `reason` | TEXT | e.g. `"Brute Force Attack (confidence: 91%)"` |
+| `risk_level` | TEXT | `'HIGH'` or `'CRITICAL'` — only these trigger auto-block |
+| `blocked_at` | TEXT | UTC ISO datetime written by the agent |
+| `status` | TEXT | `'blocked'` (active) or `'unblocked'` (analyst cleared) |
+| `unblocked_at` | TEXT | NULL while blocked; set when analyst clicks Unblock |
+
+**Files changed:**
+
+| File | What was added |
+|---|---|
+| `data/schema.sql` | `blocked_ips` table definition + `idx_blocked_ips_ip_status` index + `idx_blocked_ips_time` index |
+| `agent/main.py` | `_ensure_blocked_ips_table(conn)` — idempotent CREATE TABLE IF NOT EXISTS, called each cycle |
+| `agent/main.py` | `_block_ip(conn, alert)` — inserts to `blocked_ips` for HIGH/CRITICAL only; skips if IP already has an active block to prevent duplicate rows |
+| `agent/main.py` | `_run_agent_cycle()` — calls `_ensure_blocked_ips_table` and `_block_ip` after `_save_alert_initial`; blocking happens before LLM enrichment so the 403 is active immediately |
+| `backend/api.py` | `_is_ip_blocked(ip)` — queries `blocked_ips WHERE status='blocked'`; fail-open (returns False on any DB error so a missing table never hard-stops traffic) |
+| `backend/api.py` | `block_ip_middleware` — FastAPI `@app.middleware("http")` that runs before every route; bypasses `/health`; returns 403 JSON with explanation message for blocked IPs |
+| `dashboard/app.py` | `get_blocked_ips()` — reads all rows from `blocked_ips` ordered by `blocked_at DESC`; degrades gracefully if table doesn't exist yet |
+| `dashboard/app.py` | New **"Blocked IPs"** tab (4th tab in the analytics section) — shows each blocked IP with risk level, reason, timestamp, and status badge; active blocks have an "Unblock" button that writes `status='unblocked'` and `unblocked_at` to the DB; unblocked entries show "Cleared" |
+
+**Key design choices:**
+- MEDIUM and LOW alerts do NOT auto-block — they need human review first
+- Re-blocking the same IP (after an unblock) inserts a new row rather than updating the old one — repeat offenders are clearly visible in history
+- The `/health` endpoint is exempt from the middleware so backend health checks never fail due to IP blocking logic
+- Dashboard writes to `blocked_ips` (unblock action) — this is the first place the dashboard writes to the DB; WAL mode (now enabled on both agent and backend) makes concurrent reads/writes safe
+
+---
+
+### Fix 3 — LLM Response Caching (judge feedback: "LLM optimisation / number of requests")
+
+**Design:** An in-memory dict `_LLM_CACHE` was added to `llm_client.py`, keyed on `(threat_type, source_ip, kind)` where `kind` is `"hyp"` (hypothesis) or `"rep"` (incident report). TTL is 300 seconds — matching the `alert_cooldown_seconds` in `rules_engine.py`. Cache entries are evicted lazily on access after expiry.
+
+**Why this is needed:** The `_already_alerted()` cooldown in `rules_engine.py` already prevents duplicate alerts for the same `(threat_type, source_ip)` pair within 5 minutes. However, during a DDoS/flood scenario, multiple *different* rules can fire for the same attacker IP in a single agent cycle (e.g., DoS Flood + Brute Force + Auth Scan all trigger simultaneously). Without a cache, that is 6 Ollama calls (2 per alert × 3 alerts) in rapid succession for the same attacker. With the cache, the first alert pays the cost; subsequent alerts for the same IP in the same window return instantly.
+
+**Files changed:** `agent/llm_client.py`, `agent/main.py`
+
+| What changed | Detail |
+|---|---|
+| Added | `_LLM_CACHE: dict[tuple, tuple]` — module-level in-memory cache |
+| Added | `_CACHE_TTL_SECONDS = 300` — matches alert cooldown |
+| Added | `_cache_get(threat_type, source_ip, kind)` — returns cached string or None if expired/missing |
+| Added | `_cache_set(threat_type, source_ip, kind, value)` — stores response with current timestamp |
+| Modified | `generate_hypothesis(observation, threat_type="", source_ip="")` — added optional cache key params (backward compatible); checks cache before calling Ollama; stores result after call |
+| Modified | `generate_incident_report(...)` — derives cache key from existing `threat_type` and `source_ip` params internally; checks and stores cache |
+| Modified | `agent/main.py` `_enrich_with_llm()` — passes `threat_type=alert.threat_type, source_ip=alert.source_ip` to `generate_hypothesis()` so the cache key is populated |
+
+**Cache is intentionally in-memory only.** It resets on agent restart, which is correct — a new process should form fresh LLM opinions, not serve stale cached text from a previous run.
