@@ -145,7 +145,7 @@ It auto-refreshes every 3 seconds via Streamlit's `@st.fragment`.
 
 ---
 
-## Demo Workflow (Hackathon Presentation)
+## Demo Workflow
 
 1. Start all three components above.
 2. Open the Victim App (`http://localhost:8000`) and the Dashboard (`http://localhost:8501`) side by side.
@@ -214,8 +214,6 @@ MODEL_NAME = "llama3.1:8b"   # change to any model available in your Ollama inst
 ---
 
 ## Answering "How Can You Trust AI?"
-
-This is a common judge question for AI-powered security tools. Our answer:
 
 > **The AI makes zero security decisions.**
 >
