@@ -34,6 +34,7 @@ It resets whenever the agent process restarts, which is the correct behaviour.
 
 import json
 import time
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -302,11 +303,15 @@ def generate_incident_report(
         return cached, True  # served from cache — no Ollama call made
 
     # ── Build prompt ─────────────────────────────────────────────────────────
+    IST = timezone(timedelta(hours=5, minutes=30))
+    detected_at = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+
     system = (
         "You are a professional SOC analyst writing a brief incident report. "
-        "You will be given structured threat data. "
+        "You will be given structured threat data including the exact detection timestamp. "
         "Summarise the incident in 2-3 sentences: what happened, from where, "
         "and what action is recommended. "
+        "Always use the provided Detection Time value exactly as given — never write [date] or any placeholder. "
         "Be factual, professional, and concise. No bullet points."
     )
 
@@ -314,12 +319,13 @@ def generate_incident_report(
     hypothesis_line = f"Analyst Hypothesis: {hypothesis}\n" if hypothesis else ""
 
     prompt = (
+        f"Detection Time: {detected_at}\n"
         f"Threat Type: {threat_type}\n"
         f"Source IP: {source_ip}\n"
         f"Evidence: {details_str}\n"
         f"{hypothesis_line}"
         f"Recommended Mitigation: {mitigation}\n\n"
-        "Write a 2-3 sentence incident report paragraph."
+        "Write a 2-3 sentence incident report paragraph using the exact Detection Time above."
     )
 
     result = _query_ollama(prompt, system)
