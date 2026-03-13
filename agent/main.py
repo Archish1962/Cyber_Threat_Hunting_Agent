@@ -107,7 +107,8 @@ def _ensure_alerts_table(conn: sqlite3.Connection) -> None:
             triggered_rules TEXT,
             details         TEXT,
             llm_hypothesis  TEXT,
-            llm_report      TEXT
+            llm_report      TEXT,
+            llm_cache_used  INTEGER  NOT NULL DEFAULT 0
         );
         """
     )
@@ -115,6 +116,14 @@ def _ensure_alerts_table(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_alerts_ip_type "
         "ON alerts (source_ip, threat_type, timestamp);"
     )
+    # Add llm_cache_used to any existing alerts table that predates this column.
+    # ALTER TABLE is a no-op if the column already exists (caught and ignored).
+    try:
+        conn.execute(
+            "ALTER TABLE alerts ADD COLUMN llm_cache_used INTEGER NOT NULL DEFAULT 0"
+        )
+    except Exception:
+        pass  # column already exists — expected on all runs after the first
     conn.commit()
 
 
@@ -194,15 +203,23 @@ def _update_alert_llm(
     Called after _enrich_with_llm() returns.  Updates the row that was
     already written by _save_alert_initial(), so the dashboard record
     goes from empty LLM fields → populated LLM fields in-place.
+    Also persists llm_cache_used so the dashboard can show whether the
+    response came from the in-memory cache or a live Ollama call.
     """
     conn.execute(
         """
         UPDATE alerts
         SET llm_hypothesis = ?,
-            llm_report     = ?
+            llm_report     = ?,
+            llm_cache_used = ?
         WHERE id = ?
         """,
-        (alert.llm_hypothesis, alert.llm_report, row_id),
+        (
+            alert.llm_hypothesis,
+            alert.llm_report,
+            1 if alert.llm_cache_used else 0,
+            row_id,
+        ),
     )
     conn.commit()
 
@@ -339,26 +356,45 @@ def _enrich_with_llm(alert: ThreatAlert) -> ThreatAlert:
     observation = _build_observation(alert)
 
     # ── Step: Hypothesize ───────────────────────────────────────────────────
-    _log(
-        "info",
-        f"  ↳ Hypothesizing via LLM for {alert.threat_type} from {alert.source_ip}...",
-    )
-    alert.llm_hypothesis = generate_hypothesis(
+    hyp_text, hyp_cached = generate_hypothesis(
         observation,
         threat_type=alert.threat_type,
         source_ip=alert.source_ip,
     )
+    alert.llm_hypothesis = hyp_text
+    if hyp_cached:
+        _log(
+            "info",
+            f"  ↳ [CACHE HIT] Hypothesis served from cache — no Ollama call made "
+            f"({alert.threat_type} / {alert.source_ip})",
+        )
+    else:
+        _log(
+            "info",
+            f"  ↳ [LIVE CALL] Ollama generated hypothesis for {alert.threat_type} "
+            f"from {alert.source_ip}",
+        )
 
     # ── Step: Explain ────────────────────────────────────────────────────────
-    _log("info", "  ↳ Generating incident report...")
     mitigation = get_mitigation(alert.threat_type)
-    alert.llm_report = generate_incident_report(
+    rep_text, rep_cached = generate_incident_report(
         threat_type=alert.threat_type,
         source_ip=alert.source_ip,
         details=alert.details,
         mitigation=mitigation,
         hypothesis=alert.llm_hypothesis,
     )
+    alert.llm_report = rep_text
+    if rep_cached:
+        _log(
+            "info",
+            "  ↳ [CACHE HIT] Incident report served from cache — no Ollama call made",
+        )
+    else:
+        _log("info", "  ↳ [LIVE CALL] Ollama generated incident report")
+
+    # Mark the alert so the dashboard can display the appropriate badge
+    alert.llm_cache_used = hyp_cached or rep_cached
 
     return alert
 

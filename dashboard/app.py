@@ -56,9 +56,45 @@ html, body, [class*="css"] {
 }
 .block-container { padding: 1rem 2rem 2rem 2rem !important; }
 
-/* Hide Streamlit's built-in toolbar so the custom header isn't clipped behind it */
-[data-testid="stHeader"] { display: none !important; }
+/* Collapse the header to zero height instead of display:none so the
+   sidebar toggle button (collapsedControl) stays in the DOM and can
+   be re-styled as a floating button. display:none would remove the
+   toggle entirely, leaving no way to reopen a closed sidebar. */
+[data-testid="stHeader"] {
+    height: 0px !important;
+    min-height: 0px !important;
+    padding: 0 !important;
+    background: transparent !important;
+    border: none !important;
+    overflow: visible !important;
+}
 [data-testid="stToolbar"] { display: none !important; }
+
+/* Sidebar toggle button — floats in the top-left corner when the sidebar
+   is collapsed, styled to match the dashboard's dark cyber theme.
+   When the sidebar is open, the sidebar's own close arrow is visible
+   inside the sidebar panel, so this rule only matters when collapsed. */
+[data-testid="collapsedControl"] {
+    position: fixed !important;
+    top: 8px !important;
+    left: 8px !important;
+    z-index: 99999 !important;
+    background: rgba(13, 17, 23, 0.92) !important;
+    border: 1px solid #00ffe7 !important;
+    border-radius: 4px !important;
+    padding: 2px 6px !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    cursor: pointer !important;
+    transition: background 0.2s ease !important;
+}
+[data-testid="collapsedControl"]:hover {
+    background: rgba(0, 255, 231, 0.12) !important;
+}
+[data-testid="collapsedControl"] svg {
+    fill: #00ffe7 !important;
+}
 
 /* ── Header ── */
 .soc-header {
@@ -190,6 +226,18 @@ html, body, [class*="css"] {
 /* ── Blocked IPs tab ── */
 .blocked-header { font-size:0.65rem; letter-spacing:2px; color:#f85149; text-transform:uppercase; margin-bottom:0.5rem; }
 .sidebar-summary-box { background:#0d1117; border:1px solid #21262d; border-radius:4px; padding:0.6rem 0.8rem; margin-bottom:0.5rem; font-size:0.72rem; color:#8b949e; }
+
+/* ── LLM call-source badges (live vs cached) ── */
+.llm-live-badge {
+    font-family:'Share Tech Mono',monospace; font-size:0.6rem; letter-spacing:1.5px;
+    color:#f85149; background:rgba(248,81,73,0.08); border:1px solid rgba(248,81,73,0.3);
+    border-radius:3px; padding:3px 8px; margin:6px 0 4px 0; display:inline-block;
+}
+.llm-cache-badge {
+    font-family:'Share Tech Mono',monospace; font-size:0.6rem; letter-spacing:1.5px;
+    color:#3fb950; background:rgba(63,185,80,0.08); border:1px solid rgba(63,185,80,0.3);
+    border-radius:3px; padding:3px 8px; margin:6px 0 4px 0; display:inline-block;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -694,6 +742,7 @@ def live_dashboard():
                     )
                     llm = safe_html(t.get("llm_report", ""))
                     hypothesis = safe_html(t.get("llm_hypothesis", ""))
+                    cache_used = int(t.get("llm_cache_used") or 0)
 
                     # Parse triggered_rules safely
                     raw_rules = t.get("triggered_rules", "[]") or "[]"
@@ -711,6 +760,24 @@ def live_dashboard():
                         f"</div>"
                     )
                     badge = f'<span class="badge badge-{risk}">{risk_raw}</span>'
+
+                    # LLM source badge — shown whenever LLM text is present
+                    if llm or hypothesis:
+                        if cache_used:
+                            llm_status_block = (
+                                '<div class="llm-cache-badge">'
+                                "⚡ CACHED RESPONSE — Attack pattern already seen within last 5 min"
+                                " · Ollama call skipped, 0 new API tokens used"
+                                "</div>"
+                            )
+                        else:
+                            llm_status_block = (
+                                '<div class="llm-live-badge">'
+                                "🔴 LIVE LLM CALL — Ollama analysed this threat in real-time"
+                                "</div>"
+                            )
+                    else:
+                        llm_status_block = ""
 
                     hyp_block = (
                         f'<div class="llm-label">◈ AI HYPOTHESIS</div>'
@@ -738,6 +805,7 @@ def live_dashboard():
                         f'<div class="threat-meta">⏱ {ts} &nbsp;|&nbsp; ⚡ {ip} &nbsp;|&nbsp; CONFIDENCE {conf}%</div>'
                         f"{conf_bar}"
                         f'<div style="margin:4px 0">{rule_tags}</div>'
+                        f"{llm_status_block}"
                         f"{hyp_block}"
                         f"{llm_block}"
                         f"{mit_block}"

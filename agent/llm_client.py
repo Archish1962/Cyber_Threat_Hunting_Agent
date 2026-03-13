@@ -210,7 +210,7 @@ def generate_hypothesis(
     observation: str,
     threat_type: str = "",
     source_ip: str = "",
-) -> str:
+) -> tuple[str, bool]:
     """
     Step 2 of the agent loop: Hypothesize.
 
@@ -240,7 +240,7 @@ def generate_hypothesis(
     # ── Cache lookup ─────────────────────────────────────────────────────────
     cached = _cache_get(threat_type, source_ip, "hyp")
     if cached is not None:
-        return cached
+        return cached, True  # served from cache — no Ollama call made
 
     # ── Build prompt ─────────────────────────────────────────────────────────
     system = (
@@ -260,7 +260,7 @@ def generate_hypothesis(
     # ── Cache store ──────────────────────────────────────────────────────────
     _cache_set(threat_type, source_ip, "hyp", result)
 
-    return result
+    return result, False  # generated live by Ollama
 
 
 def generate_incident_report(
@@ -269,7 +269,7 @@ def generate_incident_report(
     details: dict,
     mitigation: str,
     hypothesis: str = "",
-) -> str:
+) -> tuple[str, bool]:
     """
     Final step of the agent loop: Explain.
 
@@ -299,7 +299,7 @@ def generate_incident_report(
     # ── Cache lookup ─────────────────────────────────────────────────────────
     cached = _cache_get(threat_type, source_ip, "rep")
     if cached is not None:
-        return cached
+        return cached, True  # served from cache — no Ollama call made
 
     # ── Build prompt ─────────────────────────────────────────────────────────
     system = (
@@ -327,7 +327,7 @@ def generate_incident_report(
     # ── Cache store ──────────────────────────────────────────────────────────
     _cache_set(threat_type, source_ip, "rep", result)
 
-    return result
+    return result, False  # generated live by Ollama
 
 
 # ── CLI smoke-test ────────────────────────────────────────────────────────────
@@ -356,10 +356,11 @@ if __name__ == "__main__":
         "52 failed login attempts from IP 192.168.1.4 "
         "in 60 seconds targeting the 'admin' account."
     )
-    hyp = generate_hypothesis(
+    hyp, hyp_cached = generate_hypothesis(
         obs, threat_type="Brute Force Attack", source_ip="192.168.1.4"
     )
     print(f"  Observation : {obs}")
+    print(f"  From cache  : {hyp_cached}")
     print(f"  Hypothesis  : {hyp}")
     print()
 
@@ -368,33 +369,33 @@ if __name__ == "__main__":
         "[Test 2] Generating hypothesis again for same (threat_type, source_ip) — should be cached..."
     )
     t0 = time.time()
-    hyp2 = generate_hypothesis(
+    hyp2, hyp2_cached = generate_hypothesis(
         obs, threat_type="Brute Force Attack", source_ip="192.168.1.4"
     )
     elapsed = time.time() - t0
-    cache_hit = elapsed < 0.01
     print(
-        f"  Elapsed     : {elapsed:.4f}s  ({'CACHE HIT ✓' if cache_hit else 'cache miss — unexpected'})"
+        f"  Elapsed     : {elapsed:.4f}s  ({'CACHE HIT ✓' if hyp2_cached else 'cache miss — unexpected'})"
     )
     print(f"  Hypothesis  : {hyp2}")
     print()
 
     # 4. Incident report test (first call — hits Ollama)
     print("[Test 3] Generating incident report (live call)...")
-    report = generate_incident_report(
+    report, rep_cached = generate_incident_report(
         threat_type="Brute Force Attack",
         source_ip="192.168.1.4",
         details={"failed_attempts": 52, "target_user": "admin", "window_seconds": 60},
         mitigation="Block IP 192.168.1.4 at firewall level and enforce immediate password reset.",
         hypothesis=hyp,
     )
+    print(f"  From cache  : {rep_cached}")
     print(f"  Report: {report}")
     print()
 
     # 5. Incident report test (second call — should hit cache)
     print("[Test 4] Generating report again for same IP — should be cached...")
     t0 = time.time()
-    report2 = generate_incident_report(
+    report2, rep2_cached = generate_incident_report(
         threat_type="Brute Force Attack",
         source_ip="192.168.1.4",
         details={"failed_attempts": 99, "target_user": "admin", "window_seconds": 60},
@@ -402,9 +403,8 @@ if __name__ == "__main__":
         hypothesis=hyp,
     )
     elapsed = time.time() - t0
-    cache_hit = elapsed < 0.01
     print(
-        f"  Elapsed : {elapsed:.4f}s  ({'CACHE HIT ✓' if cache_hit else 'cache miss — unexpected'})"
+        f"  Elapsed : {elapsed:.4f}s  ({'CACHE HIT ✓' if rep2_cached else 'cache miss — unexpected'})"
     )
     print(f"  Report  : {report2}")
     print()
