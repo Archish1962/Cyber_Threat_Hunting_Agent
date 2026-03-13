@@ -13,13 +13,40 @@ from backend.logger import log_event
 
 
 def _get_ip(request: Request) -> str:
-    """Return the client IP, falling back to 'unknown' if unavailable."""
+    """
+    Extract the real client IP, checking simulation/proxy headers first.
+
+    Priority order:
+      1. X-Forwarded-For  — injected by Requestly to simulate different attacker
+                            IPs. The leftmost value is the original client IP.
+      2. X-Real-IP        — set by nginx / HAProxy in production deployments.
+      3. request.client.host — actual TCP connection IP (local machine / LAN).
+      4. "unknown"        — final fallback if none of the above are available.
+
+    This ordering means Requestly can set X-Forwarded-For to any IP address
+    (e.g. "45.33.32.156") and every layer below — log_event(), the SQLite DB,
+    the rules engine, and the Streamlit dashboard — will treat that value as
+    the real source IP, enabling fully distributed attack simulation from a
+    single machine.
+    """
+    # 1. X-Forwarded-For — Requestly injects this for distributed attack simulation
+    xff = request.headers.get("X-Forwarded-For", "").strip()
+    if xff:
+        # Take the leftmost (original client) entry; ignore any proxy chain IPs
+        candidate = xff.split(",")[0].strip()
+        if candidate:
+            return candidate
+
+    # 2. X-Real-IP — nginx / HAProxy style single-value header
+    xri = request.headers.get("X-Real-IP", "").strip()
+    if xri:
+        return xri
+
+    # 3. Actual TCP connection IP (fallback for direct requests without headers)
     if request.client is not None:
         return request.client.host
-    # FastAPI/Starlette may return None when running behind certain proxies
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+
+    # 4. Nothing available
     return "unknown"
 
 
