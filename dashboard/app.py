@@ -245,96 +245,12 @@ html, body, [class*="css"] {
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
-# Session state for the two-step delete confirmation (persists across rerenders)
-if "confirm_delete_logs" not in st.session_state:
-    st.session_state.confirm_delete_logs = False
+# Session state for the two-step log-cleanup confirmation in the tab
+if "confirm_cleanup_logs" not in st.session_state:
+    st.session_state.confirm_cleanup_logs = False
 
 with st.sidebar:
     st.markdown("### ⚙ DASHBOARD CONTROLS")
-    st.markdown("---")
-
-    # ── Delete Raw Logs (Fix 1) ────────────────────────────────────────────
-    # Step 1: show the button. Step 2: show summary + confirm / cancel.
-    # Only raw event logs are deleted — alerts are the audit trail and are
-    # always preserved so the SOC supervisor never loses incident history.
-    if not st.session_state.confirm_delete_logs:
-        if st.button(
-            "🗑 Delete Raw Logs",
-            type="secondary",
-            use_container_width=True,
-            help="Shows a per-type count before deleting. Alerts are always preserved.",
-        ):
-            st.session_state.confirm_delete_logs = True
-            st.rerun()
-    else:
-        st.markdown("**⚠ Confirm Deletion**")
-        if not os.path.exists(DB_PATH):
-            st.warning("DB not found.")
-            st.session_state.confirm_delete_logs = False
-        else:
-            try:
-                _sc = sqlite3.connect(DB_PATH)
-                _summary = pd.read_sql_query(
-                    "SELECT event_type, COUNT(*) AS cnt FROM logs "
-                    "GROUP BY event_type ORDER BY cnt DESC",
-                    _sc,
-                )
-                _total_logs = int(
-                    pd.read_sql_query("SELECT COUNT(*) AS n FROM logs", _sc).iloc[0][
-                        "n"
-                    ]
-                )
-                _oldest = (
-                    pd.read_sql_query("SELECT MIN(timestamp) AS t FROM logs", _sc).iloc[
-                        0
-                    ]["t"]
-                    or "—"
-                )
-                _newest = (
-                    pd.read_sql_query("SELECT MAX(timestamp) AS t FROM logs", _sc).iloc[
-                        0
-                    ]["t"]
-                    or "—"
-                )
-                _alert_count = int(
-                    pd.read_sql_query("SELECT COUNT(*) AS n FROM alerts", _sc).iloc[0][
-                        "n"
-                    ]
-                )
-                _sc.close()
-
-                st.warning(f"**{_total_logs}** log entries will be deleted:")
-                for _, _row in _summary.iterrows():
-                    st.caption(f"• {_row['event_type']}: {int(_row['cnt'])}")
-                st.caption(f"📅 Oldest : {str(_oldest)[:19]}")
-                st.caption(f"📅 Newest : {str(_newest)[:19]}")
-                st.success(f"✓ {_alert_count} alert(s) will be **preserved**.")
-
-                _c1, _c2 = st.columns(2)
-                with _c1:
-                    if st.button(
-                        "✓ Delete",
-                        type="primary",
-                        use_container_width=True,
-                    ):
-                        try:
-                            _dc = sqlite3.connect(DB_PATH)
-                            _dc.execute("DELETE FROM logs")
-                            _dc.commit()
-                            _dc.close()
-                            st.session_state.confirm_delete_logs = False
-                            st.success("✓ Logs cleared.")
-                        except Exception as _de:
-                            st.error(f"Delete failed: {_de}")
-                with _c2:
-                    if st.button("✗ Cancel", use_container_width=True):
-                        st.session_state.confirm_delete_logs = False
-                        st.rerun()
-
-            except Exception as _e:
-                st.error(f"Could not load summary: {_e}")
-                st.session_state.confirm_delete_logs = False
-
     st.markdown("---")
     st.caption(f"DB path:\n`{DB_PATH}`")
     st.caption("Dashboard auto-refreshes every **3 seconds** via `@st.fragment`.")
@@ -815,12 +731,13 @@ def live_dashboard():
 
     # ── Bottom analytics tabs (replaces 3-column row to avoid page over-scroll) ─
     st.markdown("---")
-    tab1, tab2, tab3, tab4 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
         [
             "◈  EVENTS TIMELINE",
             "◈  ATTACK TYPES",
             "◈  TOP ATTACKING IPs",
             "◈  BLOCKED IPs",
+            "◈  LOG CLEANUP",
         ]
     )
 
@@ -998,12 +915,163 @@ def live_dashboard():
                     else:
                         st.caption("Cleared")
 
-    # ── Footer ────────────────────────────────────────────────────────────────
-    st.markdown("---")
-    fc1, fc2, fc3 = st.columns(3)
-    fc1.caption("🟢 DB · data/logs.sqlite")
-    fc2.caption(f"📡 Events: {total}  |  Threats: {len(threats_df)}")
-    fc3.caption("🔄 Auto-refresh every 3s  ·  powered by @st.fragment")
+    # ── Tab 5: Log Cleanup ────────────────────────────────────────────────────
+    with tab5:
+        st.markdown(
+            '<div class="section-head">◈ LOG CLEANUP — ELIGIBLE: LOGS OLDER THAN 1 HOUR</div>',
+            unsafe_allow_html=True,
+        )
+
+        if not db_ok():
+            st.markdown(
+                '<div class="empty-state">DATABASE NOT FOUND</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            try:
+                _cl = sqlite3.connect(DB_PATH)
+
+                _eligible = int(
+                    pd.read_sql_query(
+                        "SELECT COUNT(*) AS n FROM logs "
+                        "WHERE timestamp < datetime('now', '-1 hour')",
+                        _cl,
+                    ).iloc[0]["n"]
+                )
+                _recent = int(
+                    pd.read_sql_query(
+                        "SELECT COUNT(*) AS n FROM logs "
+                        "WHERE timestamp >= datetime('now', '-1 hour')",
+                        _cl,
+                    ).iloc[0]["n"]
+                )
+                _total_logs = _eligible + _recent
+                _alert_count = int(
+                    pd.read_sql_query("SELECT COUNT(*) AS n FROM alerts", _cl).iloc[0][
+                        "n"
+                    ]
+                )
+                _oldest_eligible = (
+                    pd.read_sql_query(
+                        "SELECT MIN(timestamp) AS t FROM logs "
+                        "WHERE timestamp < datetime('now', '-1 hour')",
+                        _cl,
+                    ).iloc[0]["t"]
+                    or "—"
+                )
+                _breakdown = pd.read_sql_query(
+                    "SELECT event_type, COUNT(*) AS cnt FROM logs "
+                    "WHERE timestamp < datetime('now', '-1 hour') "
+                    "GROUP BY event_type ORDER BY cnt DESC",
+                    _cl,
+                )
+                _cl.close()
+
+                # ── Stats row ─────────────────────────────────────────────────
+                cs1, cs2, cs3, cs4 = st.columns(4)
+                for _col, _cls, _val, _lbl in [
+                    (cs1, "blue", _total_logs, "TOTAL LOGS"),
+                    (cs2, "red", _eligible, "ELIGIBLE (>1H)"),
+                    (cs3, "green", _recent, "RECENT (<1H, KEPT)"),
+                    (cs4, "yellow", _alert_count, "ALERTS PRESERVED"),
+                ]:
+                    _col.markdown(
+                        f'<div class="metric-card {_cls}">'
+                        f'<div class="metric-value">{_val}</div>'
+                        f'<div class="metric-label">{_lbl}</div>'
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                st.markdown("<br>", unsafe_allow_html=True)
+
+                if _eligible == 0:
+                    st.markdown(
+                        '<div class="empty-state">✅ &nbsp; NO LOGS OLDER THAN 1 HOUR — NOTHING TO DELETE</div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.session_state.confirm_cleanup_logs = False
+                else:
+                    # ── Breakdown table ───────────────────────────────────────
+                    st.markdown(
+                        '<div class="section-head">BREAKDOWN OF ELIGIBLE LOGS BY TYPE</div>',
+                        unsafe_allow_html=True,
+                    )
+                    if not _breakdown.empty:
+                        for _, _br in _breakdown.iterrows():
+                            pct = int(_br["cnt"] / _eligible * 100) if _eligible else 0
+                            st.markdown(
+                                f'<div style="display:flex;align-items:center;'
+                                f'gap:0.6rem;margin-bottom:4px;">'
+                                f"<span style=\"font-family:'Share Tech Mono',monospace;"
+                                f'font-size:0.7rem;color:#8b949e;width:160px;">'
+                                f"{safe_html(str(_br['event_type']))}</span>"
+                                f'<div style="flex:1;background:#21262d;border-radius:3px;height:6px;">'
+                                f'<div style="width:{pct}%;background:#f85149;'
+                                f'height:6px;border-radius:3px;"></div></div>'
+                                f"<span style=\"font-family:'Share Tech Mono',monospace;"
+                                f'font-size:0.7rem;color:#f85149;width:50px;text-align:right;">'
+                                f"{int(_br['cnt'])}</span>"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+
+                    st.markdown(
+                        f'<div class="sidebar-summary-box" style="margin-top:0.6rem;">'
+                        f"📅 Oldest eligible log: <b>{str(_oldest_eligible)[:19]}</b><br>"
+                        f"🛡 <b>{_recent}</b> recent log(s) will be <b>kept</b>. "
+                        f"&nbsp;&nbsp;🔒 All <b>{_alert_count}</b> alert(s) are always preserved."
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                    st.markdown("<br>", unsafe_allow_html=True)
+
+                    # ── Two-step confirmation ─────────────────────────────────
+                    if not st.session_state.confirm_cleanup_logs:
+                        if st.button(
+                            f"🗑  Delete {_eligible} Log(s) Older Than 1 Hour",
+                            type="secondary",
+                            use_container_width=True,
+                            help="Only logs older than 1 hour are deleted. Recent logs and all alerts are preserved.",
+                        ):
+                            st.session_state.confirm_cleanup_logs = True
+                            st.rerun()
+                    else:
+                        st.warning(
+                            f"⚠ This will permanently delete **{_eligible}** log entr{'y' if _eligible == 1 else 'ies'} "
+                            f"older than 1 hour. **{_recent}** recent log(s) and all **{_alert_count}** alert(s) will be kept."
+                        )
+                        _cc1, _cc2 = st.columns(2)
+                        with _cc1:
+                            if st.button(
+                                "✓ Confirm Delete",
+                                type="primary",
+                                use_container_width=True,
+                            ):
+                                try:
+                                    _dc = sqlite3.connect(DB_PATH)
+                                    _dc.execute(
+                                        "DELETE FROM logs "
+                                        "WHERE timestamp < datetime('now', '-1 hour')"
+                                    )
+                                    _deleted = _dc.total_changes
+                                    _dc.commit()
+                                    _dc.close()
+                                    st.session_state.confirm_cleanup_logs = False
+                                    st.success(
+                                        f"✓ {_deleted} log(s) deleted. Recent logs and alerts intact."
+                                    )
+                                except Exception as _de:
+                                    st.error(f"Delete failed: {_de}")
+                        with _cc2:
+                            if st.button("✗ Cancel", use_container_width=True):
+                                st.session_state.confirm_cleanup_logs = False
+                                st.rerun()
+
+            except Exception as _ce:
+                st.error(f"Could not load cleanup stats: {_ce}")
+                st.session_state.confirm_cleanup_logs = False
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
