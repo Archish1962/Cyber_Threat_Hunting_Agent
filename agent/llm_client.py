@@ -1,7 +1,7 @@
 """
 llm_client.py - Ollama LLM Integration
 ---------------------------------------
-Handles ALL communication with the local Ollama model (llama3.2:1b).
+Handles ALL communication with the local Ollama model (llama3.1:8b).
 This module is used in TWO places by the agent:
 
   1. generate_hypothesis()  → Called right after a rule fires. Turns a raw
@@ -16,9 +16,24 @@ This module is used in TWO places by the agent:
                                    it is purely a text formatter.
 
 The AI never makes security decisions. It only talks.
+
+Caching
+-------
+An in-memory response cache is keyed on (threat_type, source_ip) with a
+5-minute TTL (matching the alert cooldown in rules_engine.py).
+
+Why this matters: during a DDoS/flood scenario, multiple rules can fire for
+the same attacker IP in the same agent cycle (e.g., DoS Flood + Brute Force +
+Auth Scan all trigger at once). Without a cache, every confirmed alert fires
+two Ollama calls each — that's 6 calls in one cycle for the same attacker.
+With the cache, the first alert pays the cost; the rest get instant responses.
+
+The cache lives in-memory only — it is intentionally NOT persisted to disk.
+It resets whenever the agent process restarts, which is the correct behaviour.
 """
 
 import json
+import time
 
 import requests
 
@@ -47,6 +62,52 @@ DEFAULT_OPTIONS = {
 # llama3.1:8b on RTX 4060 GPU takes ~1-3 s per response.
 # 30 s is generous headroom while still failing fast if something is wrong.
 REQUEST_TIMEOUT = 30
+
+
+# ── In-memory LLM response cache ─────────────────────────────────────────────
+#
+# Structure:
+#   key   → (threat_type: str, source_ip: str, kind: str)
+#              where kind is "hyp" (hypothesis) or "rep" (incident report)
+#   value → (response_text: str, unix_timestamp: float)
+#
+# TTL matches the alert cooldown so cached entries expire at the same rate
+# as the _already_alerted() guard in rules_engine.py.
+#
+# This is a plain module-level dict — it is shared across all calls within
+# the same agent process and requires no locking (the agent is single-threaded).
+
+_LLM_CACHE: dict[tuple, tuple] = {}
+_CACHE_TTL_SECONDS: int = 300  # 5 minutes
+
+
+def _cache_get(threat_type: str, source_ip: str, kind: str) -> str | None:
+    """
+    Return a cached LLM response if a fresh entry exists, otherwise None.
+
+    Args:
+        threat_type: e.g. "Brute Force Attack"
+        source_ip:   e.g. "192.168.1.4"
+        kind:        "hyp" for hypothesis, "rep" for incident report
+    """
+    if not threat_type or not source_ip:
+        return None
+    entry = _LLM_CACHE.get((threat_type, source_ip, kind))
+    if entry is None:
+        return None
+    text, ts = entry
+    if (time.time() - ts) < _CACHE_TTL_SECONDS:
+        return text
+    # Expired — evict it so the dict doesn't grow unboundedly
+    del _LLM_CACHE[(threat_type, source_ip, kind)]
+    return None
+
+
+def _cache_set(threat_type: str, source_ip: str, kind: str, value: str) -> None:
+    """Store a fresh LLM response in the cache."""
+    if not threat_type or not source_ip:
+        return
+    _LLM_CACHE[(threat_type, source_ip, kind)] = (value, time.time())
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
@@ -109,8 +170,8 @@ def check_ollama_health() -> dict:
     Returns a status dict so main.py can log a friendly startup message.
 
     Example return values:
-        {"status": "ok",      "message": "Ollama is running with model llama3.2:1b"}
-        {"status": "warning", "message": "Ollama is running but llama3.2:1b is not pulled yet."}
+        {"status": "ok",      "message": "Ollama is running with model llama3.1:8b"}
+        {"status": "warning", "message": "Ollama is running but llama3.1:8b is not pulled yet."}
         {"status": "error",   "message": "Cannot connect to Ollama on localhost:11434"}
     """
     if not _is_ollama_running():
@@ -126,7 +187,7 @@ def check_ollama_health() -> dict:
     try:
         r = requests.get(OLLAMA_TAGS_URL, timeout=3)
         models = [m["name"] for m in r.json().get("models", [])]
-        # Model names can be "llama3.2:1b" or "llama3.2:1b-instruct-q4_K_M" etc.
+        # Model names can be "llama3.1:8b" or "llama3.1:8b-instruct-q4_K_M" etc.
         model_present = any(MODEL_NAME.split(":")[0] in m for m in models)
         if model_present:
             return {
@@ -145,7 +206,11 @@ def check_ollama_health() -> dict:
         return {"status": "ok", "message": "Ollama is running (model check skipped)."}
 
 
-def generate_hypothesis(observation: str) -> str:
+def generate_hypothesis(
+    observation: str,
+    threat_type: str = "",
+    source_ip: str = "",
+) -> str:
     """
     Step 2 of the agent loop: Hypothesize.
 
@@ -154,15 +219,30 @@ def generate_hypothesis(observation: str) -> str:
     stored on the ThreatAlert and shown in the dashboard under
     "AI Hypothesis".
 
+    Cache behaviour:
+        If threat_type and source_ip are provided, a cache lookup is
+        performed first.  If a fresh entry exists (< 5 min old), the cached
+        string is returned immediately without calling Ollama.  This prevents
+        redundant calls when multiple rules fire for the same attacker in one
+        agent cycle.
+
     Args:
-        observation: e.g. "45 failed login attempts from IP 192.168.1.4
-                          in 60 seconds targeting the 'admin' account."
+        observation:  e.g. "45 failed login attempts from IP 192.168.1.4
+                           in 60 seconds targeting the 'admin' account."
+        threat_type:  Optional — used as part of the cache key.
+        source_ip:    Optional — used as part of the cache key.
 
     Returns:
         A 1-2 sentence hypothesis string, e.g.:
         "This strongly indicates a credential brute-force or dictionary
          attack targeting a privileged account."
     """
+    # ── Cache lookup ─────────────────────────────────────────────────────────
+    cached = _cache_get(threat_type, source_ip, "hyp")
+    if cached is not None:
+        return cached
+
+    # ── Build prompt ─────────────────────────────────────────────────────────
     system = (
         "You are a concise SOC analyst assistant. "
         "When given a security observation, respond with ONE to TWO sentences "
@@ -174,7 +254,13 @@ def generate_hypothesis(observation: str) -> str:
         f"Security Observation: {observation}\n\n"
         "What is the most likely attack scenario in 1-2 sentences?"
     )
-    return _query_ollama(prompt, system)
+
+    result = _query_ollama(prompt, system)
+
+    # ── Cache store ──────────────────────────────────────────────────────────
+    _cache_set(threat_type, source_ip, "hyp", result)
+
+    return result
 
 
 def generate_incident_report(
@@ -193,6 +279,13 @@ def generate_incident_report(
 
     The LLM adds NO new logic. It is a text formatter only.
 
+    Cache behaviour:
+        Keyed on (threat_type, source_ip).  If the same threat type fires
+        again from the same IP within 5 minutes, the cached report is
+        returned.  The details dict (counts) may differ slightly between
+        calls, but the narrative content is essentially identical — the
+        cache trade-off is worth it during high-volume attacks.
+
     Args:
         threat_type:  "Brute Force Attack", "Endpoint Reconnaissance", etc.
         source_ip:    The attacker's IP address.
@@ -203,6 +296,12 @@ def generate_incident_report(
     Returns:
         A 2-3 sentence professional SOC incident report paragraph.
     """
+    # ── Cache lookup ─────────────────────────────────────────────────────────
+    cached = _cache_get(threat_type, source_ip, "rep")
+    if cached is not None:
+        return cached
+
+    # ── Build prompt ─────────────────────────────────────────────────────────
     system = (
         "You are a professional SOC analyst writing a brief incident report. "
         "You will be given structured threat data. "
@@ -222,7 +321,13 @@ def generate_incident_report(
         f"Recommended Mitigation: {mitigation}\n\n"
         "Write a 2-3 sentence incident report paragraph."
     )
-    return _query_ollama(prompt, system)
+
+    result = _query_ollama(prompt, system)
+
+    # ── Cache store ──────────────────────────────────────────────────────────
+    _cache_set(threat_type, source_ip, "rep", result)
+
+    return result
 
 
 # ── CLI smoke-test ────────────────────────────────────────────────────────────
@@ -245,19 +350,37 @@ if __name__ == "__main__":
         print("Cannot run tests — Ollama is not reachable.")
         exit(1)
 
-    # 2. Hypothesis test
-    print("[Test 1] Generating hypothesis...")
+    # 2. Hypothesis test (first call — hits Ollama)
+    print("[Test 1] Generating hypothesis (live call)...")
     obs = (
         "52 failed login attempts from IP 192.168.1.4 "
         "in 60 seconds targeting the 'admin' account."
     )
-    hyp = generate_hypothesis(obs)
+    hyp = generate_hypothesis(
+        obs, threat_type="Brute Force Attack", source_ip="192.168.1.4"
+    )
     print(f"  Observation : {obs}")
     print(f"  Hypothesis  : {hyp}")
     print()
 
-    # 3. Incident report test
-    print("[Test 2] Generating incident report...")
+    # 3. Hypothesis test (second call — should hit cache)
+    print(
+        "[Test 2] Generating hypothesis again for same (threat_type, source_ip) — should be cached..."
+    )
+    t0 = time.time()
+    hyp2 = generate_hypothesis(
+        obs, threat_type="Brute Force Attack", source_ip="192.168.1.4"
+    )
+    elapsed = time.time() - t0
+    cache_hit = elapsed < 0.01
+    print(
+        f"  Elapsed     : {elapsed:.4f}s  ({'CACHE HIT ✓' if cache_hit else 'cache miss — unexpected'})"
+    )
+    print(f"  Hypothesis  : {hyp2}")
+    print()
+
+    # 4. Incident report test (first call — hits Ollama)
+    print("[Test 3] Generating incident report (live call)...")
     report = generate_incident_report(
         threat_type="Brute Force Attack",
         source_ip="192.168.1.4",
@@ -267,4 +390,23 @@ if __name__ == "__main__":
     )
     print(f"  Report: {report}")
     print()
+
+    # 5. Incident report test (second call — should hit cache)
+    print("[Test 4] Generating report again for same IP — should be cached...")
+    t0 = time.time()
+    report2 = generate_incident_report(
+        threat_type="Brute Force Attack",
+        source_ip="192.168.1.4",
+        details={"failed_attempts": 99, "target_user": "admin", "window_seconds": 60},
+        mitigation="Block IP 192.168.1.4 at firewall level and enforce immediate password reset.",
+        hypothesis=hyp,
+    )
+    elapsed = time.time() - t0
+    cache_hit = elapsed < 0.01
+    print(
+        f"  Elapsed : {elapsed:.4f}s  ({'CACHE HIT ✓' if cache_hit else 'cache miss — unexpected'})"
+    )
+    print(f"  Report  : {report2}")
+    print()
+
     print("Smoke test complete.")

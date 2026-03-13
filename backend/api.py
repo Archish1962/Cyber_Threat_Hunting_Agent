@@ -4,7 +4,7 @@ from typing import Optional
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from backend.db import init_db
+from backend.db import get_connection, init_db
 from backend.logger import log_event
 
 # ---------------------------------------------------------------------------
@@ -35,6 +35,27 @@ async def lifespan(app: FastAPI):
     # (shutdown logic goes here if needed)
 
 
+def _is_ip_blocked(ip: str) -> bool:
+    """
+    Check whether the given IP address has an active block entry in the
+    blocked_ips table.  Returns False on any DB error (fail-open) so a
+    missing or locked database never hard-stops incoming traffic.
+    """
+    try:
+        conn = get_connection()
+        cur = conn.execute(
+            "SELECT 1 FROM blocked_ips WHERE ip = ? AND status = 'blocked' LIMIT 1",
+            (ip,),
+        )
+        blocked = cur.fetchone() is not None
+        conn.close()
+        return blocked
+    except Exception:
+        # Table may not exist yet if the agent hasn't run its first cycle.
+        # Fail-open: never block traffic due to a DB lookup error.
+        return False
+
+
 app = FastAPI(
     title="Cyber Threat Hunting – Victim App",
     description=(
@@ -44,6 +65,39 @@ app = FastAPI(
     ),
     lifespan=lifespan,
 )
+
+
+# ---------------------------------------------------------------------------
+# IP Block Middleware
+# Runs before every route handler. Checks the blocked_ips table written by
+# the agent. If the source IP is blocked, the connection is killed with a
+# 403 Forbidden immediately — the route handler never executes.
+#
+# Skipped for /health so the health-check endpoint never adds DB overhead
+# and never gets accidentally blocked during a demo.
+# ---------------------------------------------------------------------------
+
+
+@app.middleware("http")
+async def block_ip_middleware(request: Request, call_next):
+    # Health check bypass — never block, never add DB overhead
+    if request.url.path == "/health":
+        return await call_next(request)
+
+    ip = _get_ip(request)
+    if _is_ip_blocked(ip):
+        return JSONResponse(
+            status_code=403,
+            content={
+                "blocked": True,
+                "message": (
+                    f"IP {ip} has been blocked by the autonomous threat hunting agent. "
+                    "Contact your SOC team to request an unblock."
+                ),
+            },
+        )
+
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------

@@ -138,3 +138,6 @@ test-results/
 # Jupyter Notebooks (checkpoints only — keep .ipynb files if any)
 # -----------------------------------------------------------------------------
 .ipynb_checkpoints/
+
+.AGENT_DOCUMENTATION.md
+.CHANGELOG.md
