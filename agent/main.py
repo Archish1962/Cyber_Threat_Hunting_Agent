@@ -348,14 +348,25 @@ def _enrich_with_llm(alert: ThreatAlert) -> ThreatAlert:
     """
     Hypothesize + Explain steps.
 
-    1. Generate a hypothesis (what kind of attack is this?).
-    2. Generate an incident report (formatted summary for the dashboard).
+    1. Build a plain-English observation from the alert's details dict using
+       the threat-type-specific _build_observation() helper.
+    2. Generate a hypothesis — the LLM explains what the attacker is doing
+       and why it is dangerous, informed by both the observation and the
+       confirmed threat type.
+    3. Generate an incident report — the LLM formats all evidence (observation,
+       hypothesis, raw details, mitigation) into a polished SOC paragraph.
+       The observation is now explicitly forwarded so each of the 8 attack
+       categories produces a correctly-contextualised report.
 
-    If Ollama is offline, placeholders are used and the agent continues normally.
+    If Ollama is offline, placeholder strings are stored and the agent
+    continues operating in rules-only mode — detection is unaffected.
     """
     observation = _build_observation(alert)
 
     # ── Step: Hypothesize ───────────────────────────────────────────────────
+    # Cache key: (threat_type, source_ip, "hyp") — each unique (attack-type, IP)
+    # pair gets its own targeted hypothesis, so multiple different threat types
+    # firing from the same IP in the same cycle each get the correct response.
     hyp_text, hyp_cached = generate_hypothesis(
         observation,
         threat_type=alert.threat_type,
@@ -365,17 +376,19 @@ def _enrich_with_llm(alert: ThreatAlert) -> ThreatAlert:
     if hyp_cached:
         _log(
             "info",
-            f"  ↳ [CACHE HIT] Hypothesis served from cache — no Ollama call made "
-            f"({alert.threat_type} / {alert.source_ip})",
+            f"  ↳ [CACHE HIT] Hypothesis ({alert.threat_type} / {alert.source_ip}) "
+            f"served from cache — Ollama call skipped",
         )
     else:
         _log(
             "info",
-            f"  ↳ [LIVE CALL] Ollama generated hypothesis for {alert.threat_type} "
+            f"  ↳ [LIVE CALL] Ollama generated hypothesis  »  {alert.threat_type} "
             f"from {alert.source_ip}",
         )
 
     # ── Step: Explain ────────────────────────────────────────────────────────
+    # The observation string is forwarded alongside the raw details dict so
+    # the LLM has a clear narrative starting point specific to this attack type.
     mitigation = get_mitigation(alert.threat_type)
     rep_text, rep_cached = generate_incident_report(
         threat_type=alert.threat_type,
@@ -383,17 +396,23 @@ def _enrich_with_llm(alert: ThreatAlert) -> ThreatAlert:
         details=alert.details,
         mitigation=mitigation,
         hypothesis=alert.llm_hypothesis,
+        observation=observation,
     )
     alert.llm_report = rep_text
     if rep_cached:
         _log(
             "info",
-            "  ↳ [CACHE HIT] Incident report served from cache — no Ollama call made",
+            f"  ↳ [CACHE HIT] Incident report ({alert.threat_type} / {alert.source_ip}) "
+            f"served from cache — Ollama call skipped",
         )
     else:
-        _log("info", "  ↳ [LIVE CALL] Ollama generated incident report")
+        _log(
+            "info",
+            f"  ↳ [LIVE CALL] Ollama generated incident report  »  {alert.threat_type}",
+        )
 
-    # Mark the alert so the dashboard can display the appropriate badge
+    # Mark the alert so the dashboard can display the live-vs-cached badge.
+    # True when EITHER the hypothesis OR the report came from the cache.
     alert.llm_cache_used = hyp_cached or rep_cached
 
     return alert

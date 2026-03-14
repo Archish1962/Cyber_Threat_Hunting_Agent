@@ -1,9 +1,39 @@
 """
 mock_generator.py  (project root)
 ----------------------------------
-Simulates all 8 attack scenarios against the REAL logs/alerts schema
-(data/schema.sql).  Use this to develop and test the dashboard or agent
-without needing the full backend + agent stack running.
+Simulates all 8 attack scenarios by writing realistic attack LOGS to
+data/logs.sqlite so the real agent can detect them, call Ollama, and write
+alerts with genuine LLM output.
+
+WHY write_alert() is NOT called from the simulate functions
+------------------------------------------------------------
+Earlier versions called write_alert() inside every simulate_* function,
+which wrote rows directly into the alerts table with hardcoded placeholder
+LLM strings.  This caused two compounding bugs:
+
+  1. The agent's _already_alerted() Tier-3 cooldown (300 s) reads the alerts
+     table.  The mock-written alerts made _already_alerted() return True for
+     every attack type → the agent skipped detection entirely → Ollama was
+     never called → real LLM output never appeared on the dashboard.
+
+  2. The hardcoded placeholder text was displayed instead of actual Ollama
+     hypothesis / incident reports, making the LLM integration appear broken.
+
+The correct separation of concerns:
+  mock_generator.py → writes attack LOGS only  (data layer: logs table)
+  agent/main.py     → detects those logs, calls Ollama, writes ALERTS
+  dashboard/app.py  → reads logs + alerts, renders everything
+
+The write_alert() helper is kept at the bottom of this file for standalone
+testing use cases (e.g. dashboard layout checks without the agent running),
+but it is never called automatically by the simulate functions.
+
+status semantics (must match backend/api.py post last-commit)
+--------------------------------------------------------------
+  "success"  → HTTP 200, request succeeded
+  "fail"     → HTTP 401, login credential failure
+  "blocked"  → HTTP 403, IP is on the blocked_ips list (middleware fired)
+  "denied"   → HTTP 403/404, restricted endpoint hit by a non-blocked IP
 
 Scenarios simulated
   1. Brute Force Attack          – >5 failed logins, same IP, same account
@@ -12,16 +42,13 @@ Scenarios simulated
   4. Credential Stuffing         – >8 distinct usernames failing, same IP
   5. Account Takeover            – failures then a successful login
   6. Data Exfiltration           – >20 successful GETs to data endpoints
-  7. Path Traversal Attack        – ../ and URL-encoded variants in endpoint
+  7. Path Traversal Attack       – ../ and URL-encoded variants in endpoint
   8. DoS Rate Flood              – >100 total requests in 60 seconds
 
 Usage:
     python mock_generator.py            # continuous loop (Ctrl-C to stop)
     python mock_generator.py --once     # fire one round of every attack then exit
     python mock_generator.py --reset    # wipe DB and exit
-
-The file writes ONLY to data/logs.sqlite using the canonical schema.
-Delete or ignore this file before the final demo once teammates are live.
 """
 
 import argparse
@@ -83,7 +110,8 @@ def init_db(reset: bool = False) -> None:
                 triggered_rules TEXT,
                 details         TEXT,
                 llm_hypothesis  TEXT,
-                llm_report      TEXT
+                llm_report      TEXT,
+                llm_cache_used  INTEGER  NOT NULL DEFAULT 0
             );
             """
         )
@@ -95,6 +123,10 @@ def init_db(reset: bool = False) -> None:
         conn = sqlite3.connect(DB_PATH)
         conn.execute("DELETE FROM logs")
         conn.execute("DELETE FROM alerts")
+        try:
+            conn.execute("DELETE FROM blocked_ips")
+        except Exception:
+            pass  # table may not exist yet
         conn.commit()
         conn.close()
         print("[db] All rows cleared (reset requested).")
@@ -130,41 +162,6 @@ def write_log(
     conn.close()
 
 
-def write_alert(
-    threat_type: str,
-    risk_level: str,
-    confidence: int,
-    source_ip: str,
-    triggered_rules: list,
-    details: dict,
-    llm_hypothesis: str = "",
-    llm_report: str = "",
-) -> None:
-    """Insert a single row into the alerts table."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """
-        INSERT INTO alerts
-            (timestamp, threat_type, risk_level, confidence, source_ip,
-             triggered_rules, details, llm_hypothesis, llm_report)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            _now(),
-            threat_type,
-            risk_level,
-            confidence,
-            source_ip,
-            json.dumps(triggered_rules),
-            json.dumps(details),
-            llm_hypothesis,
-            llm_report,
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-
 # ── Normal (benign) traffic ───────────────────────────────────────────────────
 
 _NORMAL_USERS = ["alice", "bob", "carol", "dave", "eve", "frank"]
@@ -193,12 +190,17 @@ def simulate_normal_traffic(n: int = 3) -> None:
 
 
 # ── Attack simulators ─────────────────────────────────────────────────────────
+# Each function writes ONLY to the logs table.
+# The agent reads these logs, applies the 8 detection rules, calls Ollama,
+# and writes the resulting alerts (with real LLM output) to the alerts table.
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def simulate_brute_force(attacker_ip: str = "192.168.1.4") -> None:
     """
     Rule 1: Brute Force Attack
     Fire > max_failed_logins_per_min (5) failed logins against 'admin' from one IP.
+    Writes ONLY to logs — agent detects and generates the alert + LLM output.
     """
     print(f"  [MOCK] Brute Force          -> {attacker_ip}")
     count = random.randint(12, 20)
@@ -214,39 +216,16 @@ def simulate_brute_force(attacker_ip: str = "192.168.1.4") -> None:
         )
         time.sleep(0.05)
 
-    write_alert(
-        threat_type="Brute Force Attack",
-        risk_level="HIGH",
-        confidence=90,
-        source_ip=attacker_ip,
-        triggered_rules=[
-            "rule_high_login_failure",
-            "rule_single_ip_brute",
-            "rule_untrusted_ip",
-        ],
-        details={
-            "failed_attempts": count,
-            "window_seconds": 60,
-            "threshold": 5,
-            "targeted_accounts": "admin",
-        },
-        llm_hypothesis=(
-            "This pattern strongly indicates a credential brute-force attack targeting "
-            "a privileged administrative account using automated tooling."
-        ),
-        llm_report=(
-            f"A brute-force credential attack was detected from IP {attacker_ip}. "
-            f"The source made {count} consecutive failed login attempts against the 'admin' "
-            "account within a 60-second window, far exceeding the threshold of 5 attempts/min. "
-            "Recommended action: block IP at the firewall immediately and force a password reset."
-        ),
-    )
-
 
 def simulate_recon(attacker_ip: str = "10.5.0.22") -> None:
     """
     Rule 2: Endpoint Reconnaissance
     Probe > max_restricted_hits_per_min (3) restricted paths.
+
+    status="denied": non-blocked IP hitting a restricted endpoint returns 403.
+    This matches backend/api.py semantics (status="denied" for restricted paths,
+    status="blocked" only when the blocked_ips middleware fires).
+    Writes ONLY to logs — agent detects and generates the alert + LLM output.
     """
     print(f"  [MOCK] Endpoint Recon       -> {attacker_ip}")
     restricted = [
@@ -266,45 +245,19 @@ def simulate_recon(attacker_ip: str = "10.5.0.22") -> None:
             endpoint=ep,
             ip=attacker_ip,
             status_code=403,
-            status="blocked",
+            status="denied",  # restricted endpoint hit by a non-blocked IP
         )
         time.sleep(0.1)
-
-    write_alert(
-        threat_type="Endpoint Reconnaissance",
-        risk_level="HIGH",
-        confidence=90,
-        source_ip=attacker_ip,
-        triggered_rules=[
-            "rule_restricted_recon",
-            "rule_multi_path_recon",
-            "rule_untrusted_ip",
-        ],
-        details={
-            "total_hits": len(paths_hit),
-            "unique_paths": len(paths_hit),
-            "paths_hit": ",".join(paths_hit),
-            "window_seconds": 60,
-            "threshold": 3,
-        },
-        llm_hypothesis=(
-            "The systematic probing of multiple restricted endpoints suggests automated "
-            "directory enumeration, likely the first reconnaissance phase of a targeted attack."
-        ),
-        llm_report=(
-            f"Endpoint reconnaissance was detected from IP {attacker_ip}. "
-            f"The source probed {len(paths_hit)} restricted paths "
-            f"({', '.join(paths_hit[:3])}...) in rapid succession — "
-            "consistent with automated directory scanning tools such as gobuster or dirb. "
-            "Recommended: rate-limit this IP and review access controls on all admin paths."
-        ),
-    )
 
 
 def simulate_auth_scan(attacker_ip: str = "172.16.5.99") -> None:
     """
     Rule 3: Unauthorized Access Scan
     Fire > max_401_403_per_min (6) auth failures across various endpoints.
+
+    status="denied" for 403 (restricted endpoint), status="fail" for 401
+    (login credential failure).  Matches backend/api.py semantics.
+    Writes ONLY to logs — agent detects and generates the alert + LLM output.
     """
     print(f"  [MOCK] Unauthorized Scan    -> {attacker_ip}")
     endpoints = [
@@ -323,7 +276,8 @@ def simulate_auth_scan(attacker_ip: str = "172.16.5.99") -> None:
     for _ in range(count):
         ep = random.choice(endpoints)
         code = random.choice([401, 403])
-        status = "blocked" if code == 403 else "fail"
+        # 403 = restricted endpoint (denied), 401 = login failure (fail)
+        status = "denied" if code == 403 else "fail"
         write_log(
             event_type="page_access",
             method=random.choice(["GET", "POST"]),
@@ -334,36 +288,12 @@ def simulate_auth_scan(attacker_ip: str = "172.16.5.99") -> None:
         )
         time.sleep(0.06)
 
-    write_alert(
-        threat_type="Unauthorized Access Scan",
-        risk_level="MEDIUM",
-        confidence=70,
-        source_ip=attacker_ip,
-        triggered_rules=["rule_auth_scan", "rule_untrusted_ip"],
-        details={
-            "auth_failures": count,
-            "status_codes": "401,403",
-            "endpoints_hit": ",".join(set(endpoints[:6])),
-            "window_seconds": 60,
-            "threshold": 6,
-        },
-        llm_hypothesis=(
-            "Repeated HTTP 401/403 responses across diverse endpoints indicate systematic "
-            "probing for weakly-protected or misconfigured routes."
-        ),
-        llm_report=(
-            f"An unauthorized access scan was detected from IP {attacker_ip}. "
-            f"The source accumulated {count} HTTP 401/403 responses across multiple "
-            "application endpoints in under 60 seconds, indicating automated probing. "
-            "Recommended: block source IP at the reverse proxy and audit endpoint auth middleware."
-        ),
-    )
-
 
 def simulate_credential_stuffing(attacker_ip: str = "45.33.32.156") -> None:
     """
     Rule 4: Credential Stuffing
     Try > max_distinct_users_per_min (8) DISTINCT usernames from one IP.
+    Writes ONLY to logs — agent detects and generates the alert + LLM output.
     """
     print(f"  [MOCK] Credential Stuffing  -> {attacker_ip}")
     usernames = [
@@ -396,41 +326,12 @@ def simulate_credential_stuffing(attacker_ip: str = "45.33.32.156") -> None:
         )
         time.sleep(0.04)
 
-    write_alert(
-        threat_type="Credential Stuffing",
-        risk_level="HIGH",
-        confidence=90,
-        source_ip=attacker_ip,
-        triggered_rules=[
-            "rule_credential_stuffing",
-            "rule_many_distinct_users",
-            "rule_untrusted_ip",
-        ],
-        details={
-            "distinct_usernames_tried": count,
-            "total_attempts": count,
-            "sample_usernames": ",".join(targets[:6]),
-            "window_seconds": 60,
-            "threshold": 8,
-        },
-        llm_hypothesis=(
-            "The high number of distinct usernames attempted from a single IP is consistent "
-            "with an automated credential-stuffing attack using a leaked password database."
-        ),
-        llm_report=(
-            f"A credential stuffing attack was detected from IP {attacker_ip}. "
-            f"The attacker attempted login against {count} distinct user accounts "
-            f"(including {', '.join(targets[:3])}) in under 60 seconds — "
-            "a clear sign of automated credential list enumeration. "
-            "Recommended: block IP, force resets on targeted accounts, and add CAPTCHA to /login."
-        ),
-    )
-
 
 def simulate_account_takeover(attacker_ip: str = "198.51.100.14") -> None:
     """
     Rule 5: Account Takeover
     Several failures then a successful login from the same IP.
+    Writes ONLY to logs — agent detects and generates the alert + LLM output.
     """
     print(f"  [MOCK] Account Takeover     -> {attacker_ip}")
     failure_count = random.randint(8, 15)
@@ -457,40 +358,12 @@ def simulate_account_takeover(attacker_ip: str = "198.51.100.14") -> None:
         username="alice",
     )
 
-    write_alert(
-        threat_type="Account Takeover",
-        risk_level="CRITICAL",
-        confidence=95,
-        source_ip=attacker_ip,
-        triggered_rules=[
-            "rule_account_takeover",
-            "rule_high_failure_pre_success",
-            "rule_untrusted_ip",
-        ],
-        details={
-            "failures_before_success": failure_count,
-            "compromised_account": "alice",
-            "window_seconds": 300,
-            "min_failures_threshold": 3,
-        },
-        llm_hypothesis=(
-            "Multiple failed login attempts followed by a successful authentication "
-            "strongly indicates a successful account takeover — the attacker found a valid credential."
-        ),
-        llm_report=(
-            f"A critical account takeover event was detected from IP {attacker_ip}. "
-            f"After {failure_count} failed login attempts, the attacker successfully "
-            "authenticated as user 'alice'. All active sessions for this account must be "
-            "terminated immediately and the account owner notified. "
-            "Recommended: block IP, revoke sessions, force password reset, and audit post-login activity."
-        ),
-    )
-
 
 def simulate_data_exfiltration(attacker_ip: str = "203.0.113.9") -> None:
     """
     Rule 6: Data Exfiltration
     High volume of successful GETs to data-serving endpoints.
+    Writes ONLY to logs — agent detects and generates the alert + LLM output.
     """
     print(f"  [MOCK] Data Exfiltration    -> {attacker_ip}")
     data_endpoints = [
@@ -505,10 +378,8 @@ def simulate_data_exfiltration(attacker_ip: str = "203.0.113.9") -> None:
         "/dump",
     ]
     count = random.randint(25, 40)
-    endpoints_used: list[str] = []
     for _ in range(count):
         ep = random.choice(data_endpoints)
-        endpoints_used.append(ep)
         write_log(
             event_type="api_call",
             method="GET",
@@ -519,42 +390,16 @@ def simulate_data_exfiltration(attacker_ip: str = "203.0.113.9") -> None:
         )
         time.sleep(0.04)
 
-    unique_eps = list(set(endpoints_used))
-    write_alert(
-        threat_type="Data Exfiltration",
-        risk_level="CRITICAL",
-        confidence=85,
-        source_ip=attacker_ip,
-        triggered_rules=[
-            "rule_data_scraping",
-            "rule_high_volume_scrape",
-            "rule_untrusted_ip",
-        ],
-        details={
-            "total_requests": count,
-            "unique_endpoints": len(unique_eps),
-            "endpoints_hit": ",".join(unique_eps),
-            "window_seconds": 60,
-            "threshold": 20,
-        },
-        llm_hypothesis=(
-            "High-volume automated GET requests targeting data-serving endpoints indicate "
-            "deliberate bulk data theft or systematic API scraping."
-        ),
-        llm_report=(
-            f"A data exfiltration event was detected from IP {attacker_ip}. "
-            f"The source made {count} successful GET requests to {len(unique_eps)} data-serving "
-            f"endpoints ({', '.join(unique_eps[:3])}...) within 60 seconds. "
-            "Recommended: block IP immediately, revoke API tokens, audit all accessed records, "
-            "and enforce rate-limiting on data endpoints."
-        ),
-    )
-
 
 def simulate_path_traversal(attacker_ip: str = "185.220.101.34") -> None:
     """
     Rule 7: Path Traversal Attack
     Requests containing ../ or URL-encoded equivalents.
+
+    status="denied": these requests hit the catch-all handler (404) or a
+    restricted path (403) — in both cases no blocked_ips entry exists yet,
+    so the correct status is "denied" not "blocked".
+    Writes ONLY to logs — agent detects and generates the alert + LLM output.
     """
     print(f"  [MOCK] Path Traversal       -> {attacker_ip}")
     traversal_payloads = [
@@ -575,44 +420,19 @@ def simulate_path_traversal(attacker_ip: str = "185.220.101.34") -> None:
             endpoint=payload,
             ip=attacker_ip,
             status_code=404,
-            status="blocked",
+            status="denied",  # catch-all 404 — not a blocked-IP hit
         )
         time.sleep(0.08)
-
-    has_encoding = any("%" in p.lower() for p in payloads_used)
-    rules = ["rule_path_traversal", "rule_untrusted_ip"]
-    if has_encoding:
-        rules.insert(1, "rule_encoded_traversal")
-
-    write_alert(
-        threat_type="Path Traversal Attack",
-        risk_level="HIGH",
-        confidence=95 if has_encoding else 80,
-        source_ip=attacker_ip,
-        triggered_rules=rules,
-        details={
-            "attempts": attempts,
-            "endpoints_used": "|".join(payloads_used),
-            "window_seconds": 300,
-        },
-        llm_hypothesis=(
-            "Directory traversal sequences in the request URL indicate an automated exploit "
-            "attempting to read arbitrary files from the server file system."
-        ),
-        llm_report=(
-            f"A path traversal attack was detected from IP {attacker_ip}. "
-            f"The attacker sent {attempts} requests containing directory traversal sequences "
-            "(including URL-encoded variants), attempting to escape the web root and access "
-            "sensitive server files such as /etc/passwd or .env. "
-            "Recommended: block IP, sanitize path inputs, and audit server file-system access logs."
-        ),
-    )
 
 
 def simulate_dos_flood(attacker_ip: str = "104.21.45.60") -> None:
     """
     Rule 8: DoS Rate Flood
     Extreme total request volume (> max_requests_per_min = 100).
+
+    status="denied" for non-200 responses (restricted endpoint or 404).
+    status="success" for 200 responses.
+    Writes ONLY to logs — agent detects and generates the alert + LLM output.
     """
     print(f"  [MOCK] DoS Rate Flood       -> {attacker_ip}")
     all_endpoints = ["/", "/login", "/api/data", "/profile", "/admin", "/config"]
@@ -620,7 +440,8 @@ def simulate_dos_flood(attacker_ip: str = "104.21.45.60") -> None:
     for _ in range(count):
         ep = random.choice(all_endpoints)
         code = random.choice([200, 403, 404])
-        status = "success" if code == 200 else "blocked"
+        # 200 = success, anything else = denied (restricted endpoint or not found)
+        status = "success" if code == 200 else "denied"
         write_log(
             event_type="page_access",
             method="GET",
@@ -631,36 +452,11 @@ def simulate_dos_flood(attacker_ip: str = "104.21.45.60") -> None:
         )
         time.sleep(0.01)
 
-    write_alert(
-        threat_type="DoS Rate Flood",
-        risk_level="HIGH",
-        confidence=80,
-        source_ip=attacker_ip,
-        triggered_rules=["rule_dos_flood", "rule_extreme_flood", "rule_untrusted_ip"],
-        details={
-            "total_requests": count,
-            "unique_endpoints": len(all_endpoints),
-            "window_seconds": 60,
-            "threshold": 100,
-        },
-        llm_hypothesis=(
-            "Extreme request volume from a single IP in under one minute is consistent "
-            "with an automated Denial-of-Service flood or aggressive vulnerability scanner."
-        ),
-        llm_report=(
-            f"A DoS rate flood was detected from IP {attacker_ip}. "
-            f"The source sent {count} requests in under 60 seconds across "
-            f"{len(all_endpoints)} endpoints — {count - 100} requests above the threshold. "
-            "Recommended: activate rate-limiting at the WAF/reverse-proxy, apply a temporary IP ban, "
-            "and monitor for escalation into a targeted attack."
-        ),
-    )
-
 
 # ── Scenario registry ──────────────────────────────────────────────────────────
 
 # Each entry: (function, attacker_ip, cycle_period)
-# cycle_period = "fire every N cycles"
+# cycle_period = "fire every N cycles in continuous mode"
 _SCENARIOS = [
     (simulate_brute_force, "192.168.1.4", 8),
     (simulate_recon, "10.5.0.22", 11),
@@ -680,6 +476,57 @@ def run_all_attacks_once() -> None:
         fn(ip)
         time.sleep(0.3)
     print("\n[mock] All scenarios complete.")
+    print(
+        "[mock] Start (or wait for) agent/main.py to detect these logs and call Ollama."
+    )
+
+
+# ── Standalone alert writer (kept for direct dashboard layout testing ONLY) ───
+# Do NOT call this from the simulate functions — it bypasses the agent and
+# poisons the cooldown table, preventing real LLM output from being generated.
+
+
+def write_alert(
+    threat_type: str,
+    risk_level: str,
+    confidence: int,
+    source_ip: str,
+    triggered_rules: list,
+    details: dict,
+    llm_hypothesis: str = "",
+    llm_report: str = "",
+) -> None:
+    """
+    Insert a single row directly into the alerts table.
+
+    WARNING: Only use this for isolated dashboard layout tests where the agent
+    is NOT running.  If the agent is running alongside, this call will make
+    _already_alerted() return True for the matching (threat_type, source_ip)
+    pair and suppress the agent's real detection for 300 seconds, meaning
+    Ollama never gets called and no real LLM output is generated.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        INSERT INTO alerts
+            (timestamp, threat_type, risk_level, confidence, source_ip,
+             triggered_rules, details, llm_hypothesis, llm_report)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            _now(),
+            threat_type,
+            risk_level,
+            confidence,
+            source_ip,
+            json.dumps(triggered_rules),
+            json.dumps(details),
+            llm_hypothesis,
+            llm_report,
+        ),
+    )
+    conn.commit()
+    conn.close()
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────

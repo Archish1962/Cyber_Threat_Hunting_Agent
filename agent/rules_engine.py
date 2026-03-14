@@ -194,9 +194,44 @@ def _already_alerted(
     conn: sqlite3.Connection, threat_type: str, source_ip: str
 ) -> bool:
     """
-    Return True if this (threat_type, source_ip) pair was already alerted within
-    the cooldown window.  Prevents alert storms when the agent polls every 5s.
+    Three-tier cooldown logic — prevents alert storms while ensuring repeat
+    offenders are handled more aggressively than first-time attackers.
+
+    Tier 1 — IP is CURRENTLY blocked (status='blocked' in blocked_ips):
+        Return True immediately.  The middleware is already rejecting every
+        request from this IP.  Creating another alert adds no value and would
+        just flood the dashboard with duplicate cards.
+
+    Tier 2 — IP was previously blocked but was UNBLOCKED by an analyst
+        (has a row in blocked_ips with status='unblocked'):
+        Return False unconditionally — bypass the cooldown entirely.
+        Rationale: an analyst cleared the block, the IP immediately resumed
+        attacking, so it must be re-detected and re-blocked right away without
+        waiting 5 minutes.  This is the "repeat offender fast-path".
+
+    Tier 3 — IP has never been blocked before (no entry in blocked_ips):
+        Apply the standard alert_cooldown_seconds window (default 300 s).
+        This prevents alert storms for brand-new, still-active attacks while
+        the agent is polling every 5 seconds.
     """
+    # ── Tier 1: currently blocked — no point alerting again ─────────────────
+    currently_blocked = conn.execute(
+        "SELECT 1 FROM blocked_ips WHERE ip = ? AND status = 'blocked' LIMIT 1",
+        (source_ip,),
+    ).fetchone()
+    if currently_blocked is not None:
+        return True  # already handled by middleware — suppress duplicate alert
+
+    # ── Tier 2: previously blocked and unblocked — bypass cooldown ───────────
+    previously_blocked = conn.execute(
+        "SELECT 1 FROM blocked_ips WHERE ip = ? AND status = 'unblocked' LIMIT 1",
+        (source_ip,),
+    ).fetchone()
+    if previously_blocked is not None:
+        # Skip the time-window check entirely — re-detect immediately
+        return False
+
+    # ── Tier 3: first-time attacker — apply standard cooldown ────────────────
     cooldown = BASELINE["alert_cooldown_seconds"]
     cur = conn.execute(
         """

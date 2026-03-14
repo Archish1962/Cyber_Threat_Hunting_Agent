@@ -274,6 +274,33 @@ def get_events(limit: int = 80) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def get_db_totals() -> tuple[int, int]:
+    """
+    Return (total_event_count, failed_request_count) by querying the full
+    logs table directly — NOT from the 80-row display slice used by get_events().
+
+    This ensures the KPI cards ("EVENTS CAPTURED", "FAILED REQUESTS") always
+    reflect the real database totals regardless of how many rows the live feed
+    is rendering.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        total = int(
+            pd.read_sql_query("SELECT COUNT(*) AS n FROM logs", conn).iloc[0]["n"]
+        )
+        fails = int(
+            pd.read_sql_query(
+                "SELECT COUNT(*) AS n FROM logs "
+                "WHERE status IN ('fail', '403', 'blocked', 'denied')",
+                conn,
+            ).iloc[0]["n"]
+        )
+        conn.close()
+        return total, fails
+    except Exception:
+        return 0, 0
+
+
 def get_threats(limit: int = 20) -> pd.DataFrame:
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -353,14 +380,18 @@ def get_timeline_data() -> pd.DataFrame:
 
 
 # ── Pure helpers ──────────────────────────────────────────────────────────────
-def get_stats(events_df: pd.DataFrame, threats_df: pd.DataFrame):
-    total = len(events_df)
-    # v1 only counted "fail" — now we count 403 and blocked too
-    fails = (
-        int(events_df["status"].isin(["fail", "403", "blocked", "denied"]).sum())
-        if total
-        else 0
-    )
+def get_stats(threats_df: pd.DataFrame) -> tuple[int, int, int, int]:
+    """
+    Return (total_events, failed_requests, active_threats, flagged_ips).
+
+    total_events and failed_requests come from get_db_totals() which queries
+    the FULL logs table — not the 80-row display slice.  This fixes the KPI
+    cards showing a maximum of 80 regardless of actual traffic volume.
+
+    active_threats and flagged_ips are derived from threats_df (the 20 most
+    recent alerts) which is sufficient for the live threat summary.
+    """
+    total, fails = get_db_totals()
     active_threats = (
         int(threats_df["risk_level"].isin(["HIGH", "CRITICAL"]).sum())
         if len(threats_df)
@@ -496,7 +527,8 @@ def live_dashboard():
     # ── Load data ─────────────────────────────────────────────────────────────
     events_df = get_events()
     threats_df = get_threats()
-    total, fails, active_threats, flagged_ips = get_stats(events_df, threats_df)
+    # get_stats queries the DB directly for totals — events_df is only for display
+    total, fails, active_threats, flagged_ips = get_stats(threats_df)
 
     # ── Status banner ─────────────────────────────────────────────────────────
     # risk_level is stored uppercase by the real agent ("HIGH", "CRITICAL", etc.)
