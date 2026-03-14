@@ -38,6 +38,7 @@ import json
 import os
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import List
 
@@ -71,6 +72,26 @@ from rules_engine import ThreatAlert, get_mitigation, run_all_rules  # noqa: E40
 POLL_INTERVAL_SECONDS = 5  # how often to query the DB for new threats
 MIN_CONFIDENCE_TO_ALERT = 40  # alerts below this confidence are silently dropped
 STARTUP_WAIT_SECONDS = 2  # brief pause between startup checks
+
+# ---------------------------------------------------------------------------
+# LLM thread pool
+# ---------------------------------------------------------------------------
+# The fundamental reason LLM output was never appearing was that all Ollama
+# calls were made SYNCHRONOUSLY inside _run_agent_cycle().  With llama3.1:8b
+# taking 20–40 s per call and 2 calls per attack type × 8 attack types, the
+# detection loop was blocked for up to 10 minutes per cycle.  During that
+# time, every log written by the mock generator or real backend went outside
+# the 60-second rule window, so subsequent cycles detected nothing and Ollama
+# was never called again.
+#
+# Fix: a single-worker ThreadPoolExecutor runs all LLM work in the background.
+# The detection loop saves the alert to the DB immediately (empty LLM fields),
+# dispatches a task to the pool, and returns to polling within milliseconds.
+# The worker thread opens its own DB connection, calls Ollama, and does a
+# targeted UPDATE on the alert row when the response arrives.
+#
+# max_workers=1 serialises Ollama calls so the GPU/CPU is never flooded.
+_LLM_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm-worker")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -550,11 +571,56 @@ def _startup_checks() -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _llm_worker(alert: ThreatAlert, row_id: int) -> None:
+    """
+    Background thread task — called by _LLM_EXECUTOR after detection.
+
+    Opens its own DB connection (required: SQLite connections are not
+    thread-safe across threads), calls Ollama for hypothesis + report,
+    then does a targeted UPDATE on the alert row.
+
+    If Ollama is offline or times out the error string is stored as-is
+    so the dashboard always shows something (never silently empty).
+    """
+    try:
+        enriched = _enrich_with_llm(alert)
+        # Each worker thread needs its own connection — never share across threads
+        conn = _get_connection()
+        try:
+            _update_alert_llm(conn, row_id, enriched)
+        finally:
+            conn.close()
+        _log(
+            "ok",
+            f"[LLM] id={row_id} | {enriched.threat_type} | {enriched.source_ip}"
+            f"{'  [CACHED]' if enriched.llm_cache_used else '  [LIVE]'}",
+        )
+    except Exception as exc:
+        _log("error", f"[LLM] Worker failed for alert id={row_id}: {exc}")
+        import traceback
+
+        traceback.print_exc()
+
+
 def _run_agent_cycle() -> list:
     """
     One full Observe → Investigate → Decide cycle.
-    Opens and closes the DB connection each cycle to prevent stale reads.
-    Returns the list of confirmed, LLM-enriched alerts written this cycle.
+
+    IMPORTANT — why this function must return in milliseconds
+    ---------------------------------------------------------
+    Previously, Ollama calls were made SYNCHRONOUSLY here.  With
+    llama3.1:8b taking 20–40 s per call and 2 calls per alert × up to
+    8 alerts per cycle, the loop could be blocked for 10+ minutes.
+    During that time every log written by the mock or real backend went
+    outside the 60-second rule window, so subsequent cycles detected
+    nothing and the LLM was effectively never called again.
+
+    Fix: detection + DB save happen here (fast, <1 s).  LLM work is
+    dispatched to _LLM_EXECUTOR (a single-worker ThreadPoolExecutor)
+    which runs _llm_worker in the background.  The worker opens its own
+    DB connection, calls Ollama, and UPDATEs the row when done.  The
+    dashboard auto-refreshes every 3 s so the LLM fields appear as soon
+    as Ollama responds — typically 20–40 s after detection.
     """
     conn = _get_connection()
     try:
@@ -563,25 +629,18 @@ def _run_agent_cycle() -> list:
         _ensure_blocked_ips_table(conn)
 
         # ── Step 1: Observe + Investigate ───────────────────────────────────
-        # run_all_rules queries the logs table and applies every rule.
-        # run_all_rules returns List[ThreatAlert].  We avoid re-annotating with
-        # the imported ThreatAlert here to prevent Pyright flagging an
-        # invariant-list mismatch when sys.path causes two copies of
-        # rules_engine to be registered under different module names.
         candidates = run_all_rules(conn)
 
         # ── Step 2: Decide ───────────────────────────────────────────────────
-        # Filter out low-confidence candidates that don't meet our threshold.
         confirmed = [a for a in candidates if a.confidence >= MIN_CONFIDENCE_TO_ALERT]  # type: ignore[union-attr]
 
         if not confirmed:
             return []
 
-        saved: List[ThreatAlert] = []
+        dispatched: List[ThreatAlert] = []
         for alert in confirmed:
             # ── Step 3: Persist detection immediately (LLM fields empty) ────
-            # Dashboard can display the threat the instant rules fire.
-            # llama3.1:8b takes 20-40 s per call — we never block the UI on it.
+            # The dashboard shows the threat card the instant the rule fires.
             row_id = _save_alert_initial(conn, alert)
             _log(
                 "alert",
@@ -590,21 +649,22 @@ def _run_agent_cycle() -> list:
             )
 
             # ── Step 3b: Block IP immediately for HIGH / CRITICAL threats ────
-            # Writes to blocked_ips table. Backend middleware reads it and
-            # returns 403 to the attacker on all subsequent requests.
             _block_ip(conn, alert)
 
-            # ── Step 4: Hypothesize + Explain (LLM) ─────────────────────────
-            # Runs AFTER the DB write so the dashboard is never blocked.
-            alert = _enrich_with_llm(alert)
+            # ── Step 4: Dispatch LLM work to background thread ───────────────
+            # _llm_worker opens its own connection, calls Ollama (hypothesis +
+            # report), and UPDATEs the row.  This call returns immediately —
+            # the detection loop is never blocked by Ollama response time.
+            _LLM_EXECUTOR.submit(_llm_worker, alert, row_id)
+            _log(
+                "info",
+                f"  ↳ LLM enrichment queued for id={row_id} "
+                f"({alert.threat_type} / {alert.source_ip})",
+            )
 
-            # ── Step 5: Update the same row with LLM output ──────────────────
-            _update_alert_llm(conn, row_id, alert)
-            _log("info", f"  ↳ LLM report written for alert id={row_id}")
+            dispatched.append(alert)
 
-            saved.append(alert)
-
-        return saved
+        return dispatched
 
     finally:
         conn.close()
@@ -641,6 +701,10 @@ def main() -> None:  # noqa: C901
 
                 if alerts:
                     for alert in alerts:
+                        # Banner is printed immediately after detection.
+                        # LLM fields are empty here — they are filled in by the
+                        # background worker and will appear on the dashboard
+                        # automatically once Ollama responds (20–40 s later).
                         _print_alert_banner(alert)
                 else:
                     # Quiet heartbeat every 12 cycles (~60s) to show the agent is alive
@@ -660,7 +724,11 @@ def main() -> None:  # noqa: C901
 
     except KeyboardInterrupt:
         print()
-        _log("info", "Agent stopped by user (Ctrl+C). Goodbye.")
+        _log("info", "Shutting down — waiting for queued LLM tasks to finish...")
+        # cancel_futures=False: let any already-running Ollama call complete so
+        # its alert row gets updated rather than staying with empty LLM fields.
+        _LLM_EXECUTOR.shutdown(wait=True, cancel_futures=False)
+        _log("info", "Agent stopped. Goodbye.")
         sys.exit(0)
 
 
