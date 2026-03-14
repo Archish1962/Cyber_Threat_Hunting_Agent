@@ -157,7 +157,8 @@ html, body, [class*="css"] {
 }
 .feed-row.fail    { background:rgba(248,81,73,0.08);  color:#f85149; }
 .feed-row.success { background:rgba(63,185,80,0.06);  color:#3fb950; }
-.feed-row.blocked { background:rgba(210,153,34,0.08); color:#d29922; }
+.feed-row.blocked { background:rgba(210,153,34,0.12); color:#d29922; border-left:2px solid #d29922; }
+.feed-row.denied  { background:rgba(248,81,73,0.06);  color:#c85149; }
 .feed-row.normal  { color:#8b949e; }
 .feed-container   { max-height:300px; overflow-y:auto; scrollbar-width:thin; scrollbar-color:#21262d transparent; }
 
@@ -356,7 +357,9 @@ def get_stats(events_df: pd.DataFrame, threats_df: pd.DataFrame):
     total = len(events_df)
     # v1 only counted "fail" — now we count 403 and blocked too
     fails = (
-        int(events_df["status"].isin(["fail", "403", "blocked"]).sum()) if total else 0
+        int(events_df["status"].isin(["fail", "403", "blocked", "denied"]).sum())
+        if total
+        else 0
     )
     active_threats = (
         int(threats_df["risk_level"].isin(["HIGH", "CRITICAL"]).sum())
@@ -579,12 +582,23 @@ def live_dashboard():
                     else "success"
                     if sta == "success"
                     else "blocked"
-                    if sta in ("blocked", "403", "403")
+                    if sta == "blocked"
+                    else "denied"
+                    if sta in ("denied", "403")
                     else "normal"
+                )
+                # "blocked" = agent blocked this IP (middleware fired)
+                # "denied"  = restricted endpoint hit (everyone gets 403 here)
+                label = (
+                    "BLOCKED — IP ON BLOCK LIST"
+                    if sta == "blocked"
+                    else "DENIED — RESTRICTED ENDPOINT"
+                    if sta == "denied"
+                    else sta.upper()
                 )
                 rows_html += (
                     f'<div class="feed-row {css}">'
-                    f"{ts}  {met:<4}  {ep:<22} {usr:<10} {ip:<16} [{sta.upper()}]"
+                    f"{ts}  {met:<4}  {ep:<22} {usr:<10} {ip:<16} [{label}]"
                     f"</div>"
                 )
             st.markdown(

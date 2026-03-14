@@ -113,6 +113,20 @@ async def block_ip_middleware(request: Request, call_next):
 
     ip = _get_ip(request)
     if _is_ip_blocked(ip):
+        # Log the block so [BLOCKED] in the live feed always means the agent
+        # has this IP on the blocked list — not just a restricted endpoint hit.
+        try:
+            log_event(
+                event_type="page_access",
+                method=request.method,
+                endpoint=str(request.url.path) or "/",
+                username=None,
+                ip=ip,
+                status_code=403,
+                status="blocked",
+            )
+        except Exception:
+            pass  # never let a logging failure break the middleware response
         return JSONResponse(
             status_code=403,
             content={
@@ -248,7 +262,7 @@ async def admin(request: Request):
         username=None,
         ip=ip,
         status_code=403,
-        status="blocked",
+        status="denied",
     )
     return JSONResponse(status_code=403, content={"message": "Admin access denied"})
 
@@ -263,7 +277,7 @@ async def config(request: Request):
         username=None,
         ip=ip,
         status_code=403,
-        status="blocked",
+        status="denied",
     )
     return JSONResponse(status_code=403, content={"message": "Forbidden"})
 
@@ -278,7 +292,7 @@ async def internal(request: Request):
         username=None,
         ip=ip,
         status_code=403,
-        status="blocked",
+        status="denied",
     )
     return JSONResponse(status_code=403, content={"message": "Forbidden"})
 
@@ -293,7 +307,7 @@ async def dashboard_admin(request: Request):
         username=None,
         ip=ip,
         status_code=403,
-        status="blocked",
+        status="denied",
     )
     return JSONResponse(
         status_code=403, content={"message": "Dashboard access restricted"}
@@ -310,7 +324,7 @@ async def settings(request: Request):
         username=None,
         ip=ip,
         status_code=403,
-        status="blocked",
+        status="denied",
     )
     return JSONResponse(status_code=403, content={"message": "Settings access denied"})
 
@@ -325,7 +339,7 @@ async def env_file(request: Request):
         username=None,
         ip=ip,
         status_code=403,
-        status="blocked",
+        status="denied",
     )
     return JSONResponse(status_code=403, content={"message": "Forbidden"})
 
@@ -340,7 +354,7 @@ async def dot_env(request: Request):
         username=None,
         ip=ip,
         status_code=403,
-        status="blocked",
+        status="denied",
     )
     return JSONResponse(status_code=403, content={"message": "Forbidden"})
 
@@ -355,7 +369,7 @@ async def api_keys(request: Request):
         username=None,
         ip=ip,
         status_code=403,
-        status="blocked",
+        status="denied",
     )
     return JSONResponse(status_code=403, content={"message": "Forbidden"})
 
@@ -592,6 +606,6 @@ async def catch_all(full_path: str, request: Request):
         username=None,
         ip=ip,
         status_code=404,
-        status="blocked",
+        status="denied",
     )
     return JSONResponse(status_code=404, content={"message": "Not found"})
