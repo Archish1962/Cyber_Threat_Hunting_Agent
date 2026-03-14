@@ -83,36 +83,80 @@ REQUEST_TIMEOUT = 30
 # the same agent process and requires no locking (the agent is single-threaded).
 
 _LLM_CACHE: dict[tuple, tuple] = {}
-_CACHE_TTL_SECONDS: int = 300  # 5 minutes
+
+# Two separate TTLs for the two kinds of LLM call:
+#
+#   Hypothesis (kind="hyp") — answers "what is this IP doing?"
+#     Keyed on (source_ip, kind) only — no threat_type.
+#     Shared across ALL rules that fire for the same IP in the same window.
+#     This is what makes multi-rule same-IP cycles pay only ONE Ollama call.
+#     Short TTL (60 s) so the hypothesis stays fresh across adjacent cycles.
+#
+#   Report (kind="rep") — formatted SOC incident paragraph, threat-type specific.
+#     Keyed on (threat_type, source_ip, kind).
+#     TTL is 360 s — intentionally 60 s LONGER than the 300 s alert cooldown.
+#     This guarantees a cache hit when the same alert re-fires after the
+#     cooldown lifts: cooldown expires at t=300, cache expires at t=360,
+#     so the re-alert at t=300 still finds a warm cache entry.
+_CACHE_HYP_TTL_SECONDS: int = 60  # hypothesis: IP-scoped, short window
+_CACHE_REP_TTL_SECONDS: int = 360  # report:     outlasts the 300 s cooldown
 
 
 def _cache_get(threat_type: str, source_ip: str, kind: str) -> str | None:
     """
     Return a cached LLM response if a fresh entry exists, otherwise None.
 
+    Cache key strategy:
+      "hyp" → keyed on (source_ip, kind) only.
+              Hypothesis is about what the IP is doing, not which specific
+              rule fired. Dropping threat_type from the key lets all rules
+              that fire for the same IP in the same cycle share one call.
+              TTL = 60 s (_CACHE_HYP_TTL_SECONDS).
+
+      "rep" → keyed on (threat_type, source_ip, kind).
+              Reports are threat-type specific (they name the attack in prose).
+              TTL = 360 s (_CACHE_REP_TTL_SECONDS) — 60 s longer than the
+              300 s alert cooldown — so a re-alert after the cooldown lifts
+              still finds a warm cache entry.
+
     Args:
         threat_type: e.g. "Brute Force Attack"
         source_ip:   e.g. "192.168.1.4"
         kind:        "hyp" for hypothesis, "rep" for incident report
     """
-    if not threat_type or not source_ip:
+    if not source_ip:
         return None
-    entry = _LLM_CACHE.get((threat_type, source_ip, kind))
+    if kind == "hyp":
+        key = (source_ip, kind)
+        ttl = _CACHE_HYP_TTL_SECONDS
+    else:
+        if not threat_type:
+            return None
+        key = (threat_type, source_ip, kind)
+        ttl = _CACHE_REP_TTL_SECONDS
+
+    entry = _LLM_CACHE.get(key)
     if entry is None:
         return None
     text, ts = entry
-    if (time.time() - ts) < _CACHE_TTL_SECONDS:
+    if (time.time() - ts) < ttl:
         return text
-    # Expired — evict it so the dict doesn't grow unboundedly
-    del _LLM_CACHE[(threat_type, source_ip, kind)]
+    # Expired — evict so the dict doesn't grow unboundedly
+    del _LLM_CACHE[key]
     return None
 
 
 def _cache_set(threat_type: str, source_ip: str, kind: str, value: str) -> None:
-    """Store a fresh LLM response in the cache."""
-    if not threat_type or not source_ip:
+    """Store a fresh LLM response in the cache using the same key logic as _cache_get."""
+    if not source_ip:
         return
-    _LLM_CACHE[(threat_type, source_ip, kind)] = (value, time.time())
+    if kind == "hyp":
+        key = (source_ip, kind)
+    else:
+        if not threat_type:
+            return
+        key = (threat_type, source_ip, kind)
+    _LLM_CACHE[key] = (value, time.time())
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────────

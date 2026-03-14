@@ -113,6 +113,22 @@ async def block_ip_middleware(request: Request, call_next):
 
     ip = _get_ip(request)
     if _is_ip_blocked(ip):
+        # Log the blocked request so it appears in the SOC events feed.
+        # Without this the dashboard goes dark for a blocked IP — every
+        # request after the block is silently dropped and never written
+        # to the DB, making it look like the attack stopped.
+        try:
+            log_event(
+                event_type="page_access",
+                method=request.method,
+                endpoint=str(request.url.path) or "/",
+                username=None,
+                ip=ip,
+                status_code=403,
+                status="blocked",
+            )
+        except Exception:
+            pass  # never let a logging failure break the middleware response
         return JSONResponse(
             status_code=403,
             content={
