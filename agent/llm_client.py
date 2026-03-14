@@ -33,6 +33,7 @@ It resets whenever the agent process restarts, which is the correct behaviour.
 """
 
 import json
+import os
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -43,11 +44,14 @@ OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_GENERATE_URL = f"{OLLAMA_BASE_URL}/api/generate"
 OLLAMA_TAGS_URL = f"{OLLAMA_BASE_URL}/api/tags"  # used for health-check
 
-# Optimised for RTX 4060 (8 GB VRAM). Run once to download:  ollama pull llama3.1:8b
-# Uses ~4.7 GB VRAM — fits the 8 GB card with ~3 GB to spare.
-# Ollama automatically detects and uses the GPU (CUDA) — no config needed.
-# Response time: ~1-3 s per call on GPU (was 20-40 s on CPU).
-MODEL_NAME = "llama3.1:8b"
+# Model is configured via the OLLAMA_MODEL environment variable so the same
+# codebase works on different machines without any code changes:
+#   Local (RTX 4060 GPU): env var not set → falls back to "llama3.1:8b"
+#                         ~1-3 s/response on GPU, uses ~4.7 GB VRAM.
+#   AWS EC2 (CPU only):   set OLLAMA_MODEL=llama3.2:1b in the server env
+#                         → uses the smaller model that fits in 8 GB RAM.
+# To override locally:  export OLLAMA_MODEL=llama3.2:1b  (or any pulled model)
+MODEL_NAME = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 
 # Generation options — tuned for RTX 4060 GPU inference.
 # GPU is fast enough that we no longer need to sacrifice quality for speed.
