@@ -918,7 +918,7 @@ def live_dashboard():
     # ── Tab 5: Log Cleanup ────────────────────────────────────────────────────
     with tab5:
         st.markdown(
-            '<div class="section-head">◈ LOG CLEANUP — ELIGIBLE: LOGS OLDER THAN 1 HOUR</div>',
+            '<div class="section-head">◈ LOG CLEANUP — ELIGIBLE: LOGS OLDER THAN 15 MINUTES</div>',
             unsafe_allow_html=True,
         )
 
@@ -934,14 +934,14 @@ def live_dashboard():
                 _eligible = int(
                     pd.read_sql_query(
                         "SELECT COUNT(*) AS n FROM logs "
-                        "WHERE timestamp < datetime('now', '-1 hour')",
+                        "WHERE timestamp < datetime('now', '-15 minutes')",
                         _cl,
                     ).iloc[0]["n"]
                 )
                 _recent = int(
                     pd.read_sql_query(
                         "SELECT COUNT(*) AS n FROM logs "
-                        "WHERE timestamp >= datetime('now', '-1 hour')",
+                        "WHERE timestamp >= datetime('now', '-15 minutes')",
                         _cl,
                     ).iloc[0]["n"]
                 )
@@ -954,14 +954,14 @@ def live_dashboard():
                 _oldest_eligible = (
                     pd.read_sql_query(
                         "SELECT MIN(timestamp) AS t FROM logs "
-                        "WHERE timestamp < datetime('now', '-1 hour')",
+                        "WHERE timestamp < datetime('now', '-15 minutes')",
                         _cl,
                     ).iloc[0]["t"]
                     or "—"
                 )
                 _breakdown = pd.read_sql_query(
                     "SELECT event_type, COUNT(*) AS cnt FROM logs "
-                    "WHERE timestamp < datetime('now', '-1 hour') "
+                    "WHERE timestamp < datetime('now', '-15 minutes') "
                     "GROUP BY event_type ORDER BY cnt DESC",
                     _cl,
                 )
@@ -971,8 +971,8 @@ def live_dashboard():
                 cs1, cs2, cs3, cs4 = st.columns(4)
                 for _col, _cls, _val, _lbl in [
                     (cs1, "blue", _total_logs, "TOTAL LOGS"),
-                    (cs2, "red", _eligible, "ELIGIBLE (>1H)"),
-                    (cs3, "green", _recent, "RECENT (<1H, KEPT)"),
+                    (cs2, "red", _eligible, "ELIGIBLE (>15M)"),
+                    (cs3, "green", _recent, "RECENT (<15M, KEPT)"),
                     (cs4, "yellow", _alert_count, "ALERTS PRESERVED"),
                 ]:
                     _col.markdown(
@@ -987,7 +987,7 @@ def live_dashboard():
 
                 if _eligible == 0:
                     st.markdown(
-                        '<div class="empty-state">✅ &nbsp; NO LOGS OLDER THAN 1 HOUR — NOTHING TO DELETE</div>',
+                        '<div class="empty-state">✅ &nbsp; NO LOGS OLDER THAN 15 MINUTES — NOTHING TO DELETE</div>',
                         unsafe_allow_html=True,
                     )
                     st.session_state.confirm_cleanup_logs = False
@@ -1030,17 +1030,17 @@ def live_dashboard():
                     # ── Two-step confirmation ─────────────────────────────────
                     if not st.session_state.confirm_cleanup_logs:
                         if st.button(
-                            f"🗑  Delete {_eligible} Log(s) Older Than 1 Hour",
+                            f"🗑  Delete {_eligible} Log(s) Older Than 15 Minutes",
                             type="secondary",
                             use_container_width=True,
-                            help="Only logs older than 1 hour are deleted. Recent logs and all alerts are preserved.",
+                            help="Only logs older than 15 minutes are deleted. Recent logs and all alerts are preserved.",
                         ):
                             st.session_state.confirm_cleanup_logs = True
                             st.rerun()
                     else:
                         st.warning(
                             f"⚠ This will permanently delete **{_eligible}** log entr{'y' if _eligible == 1 else 'ies'} "
-                            f"older than 1 hour. **{_recent}** recent log(s) and all **{_alert_count}** alert(s) will be kept."
+                            f"older than 15 minutes. **{_recent}** recent log(s) and all **{_alert_count}** alert(s) will be kept."
                         )
                         _cc1, _cc2 = st.columns(2)
                         with _cc1:
@@ -1053,7 +1053,7 @@ def live_dashboard():
                                     _dc = sqlite3.connect(DB_PATH)
                                     _dc.execute(
                                         "DELETE FROM logs "
-                                        "WHERE timestamp < datetime('now', '-1 hour')"
+                                        "WHERE timestamp < datetime('now', '-15 minutes')"
                                     )
                                     _deleted = _dc.total_changes
                                     _dc.commit()
