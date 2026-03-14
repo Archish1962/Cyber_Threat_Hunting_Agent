@@ -945,7 +945,12 @@ def live_dashboard():
                         _cl,
                     ).iloc[0]["n"]
                 )
-                _total_logs = _eligible + _recent
+                _total_logs = int(
+                    pd.read_sql_query(
+                        "SELECT COUNT(*) AS n FROM logs",
+                        _cl,
+                    ).iloc[0]["n"]
+                )
                 _alert_count = int(
                     pd.read_sql_query("SELECT COUNT(*) AS n FROM alerts", _cl).iloc[0][
                         "n"
